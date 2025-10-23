@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>실시간 웹캠</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="container">
+    <h1>실시간 화면</h1>
+    <div class="video-container">
+      <img id="cameraFeed" src="{{ url_for('video_feed') }}" alt="Camera Feed">
+    </div>
+    <div class="status" id="status">카메라 연결 중...</div>
+
+    <button id="btn119" class="btn-emergency">
+      🚨 119 신고
+    </button>
+
+    <div id="popup" class="popup-card">
+      <p>119에 신고하시겠습니다?<br>모바일에서는 전화 연결이 됩니다.</p>
+      <button id="confirmBtn">확인</button>
+      <button id="cancelBtn">취소</button>
+    </div>
+
+  <script src="{{ url_for('static', filename='script.js') }}"></script>
+  </body>
+</html>
