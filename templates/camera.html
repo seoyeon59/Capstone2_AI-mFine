@@ -8,22 +8,37 @@
 </head>
 <body>
   <div class="container">
-    <h1>실시간 화면</h1>
-    <div class="video-container">
-      <img id="cameraFeed" src="{{ url_for('video_feed') }}" alt="Camera Feed">
+    <h1>실시간 낙상 감지 시스템</h1>
+
+    <div class="main-content">
+      <!-- 왼쪽: 실시간 영상 -->
+      <div class="video-section">
+        <div class="video-container">
+          <img id="cameraFeed" src="{{ url_for('video_feed') }}" alt="Camera Feed">
+        </div>
+        <div class="status" id="status">카메라 연결 중...</div>
+      </div>
+
+      <!-- 오른쪽: 위험 점수 -->
+      <div class="score-section">
+        <h2>낙상 위험 확률</h2>
+        <div class="risk-score" id="riskScore">0%</div>
+        <div class="risk-bar">
+          <div class="arrow" id="arrow"></div>
+        </div>
+
+        <button id="btn119">🚨 119 신고</button>
+      </div>
     </div>
-    <div class="status" id="status">카메라 연결 중...</div>
 
-    <button id="btn119" class="btn-emergency">
-      🚨 119 신고
-    </button>
-
+    <!-- 🚨 팝업 카드 -->
     <div id="popup" class="popup-card">
-      <p>119에 신고하시겠습니다?<br>모바일에서는 전화 연결이 됩니다.</p>
+      <p>119에 신고하시겠습니까?<br>모바일에서는 전화 연결이 됩니다.</p>
       <button id="confirmBtn">확인</button>
       <button id="cancelBtn">취소</button>
     </div>
+  </div>
 
   <script src="{{ url_for('static', filename='script.js') }}"></script>
-  </body>
+</body>
 </html>
