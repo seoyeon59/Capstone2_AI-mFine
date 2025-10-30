@@ -4,7 +4,7 @@ body {
   display: flex;
   justify-content: center;
   align-items: center;
-  height: 100vh;
+  min-height: 100vh; /* 세로 중앙 유지 */
   margin: 0;
 }
 
@@ -15,6 +15,8 @@ body {
   box-shadow: 0 4px 15px rgba(0,0,0,0.1);
   width: 90%;
   max-width: 1000px;
+  box-sizing:border-box;
+  margin: 1 auto;
 }
 
 h1 {

@@ -1,4 +1,4 @@
-from flask import Flask, Response, render_template, jsonify
+from flask import Flask, Response, render_template, jsonify, request, redirect, session
 import cv2
 import mediapipe as mp
 import pandas as pd
@@ -6,8 +6,20 @@ import sqlite3
 import numpy as np
 import threading
 import time
+from alert_utils import send_sms
+from playsound import playsound  # pip install playsound==1.2.2
 
 app = Flask(__name__)
+
+# ==========================
+# SQLite 연결 (회원가입/로그인용)
+# ==========================
+DB_PATH = 'capstone2.db'
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row  # 컬럼명을 dict처럼 사용 가능
+    return conn
 
 # ==========================
 # MediaPipe Pose 초기화
@@ -109,10 +121,68 @@ def gen_frames():
         frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
 # ==========================
 # Flask 라우팅
 # ==========================
+# ==========================
+# 홈 (로그인 페이지)
+# ==========================
 @app.route('/')
+def home():
+    return render_template('login.html')
+
+# ==========================
+# 로그인 기능
+# ==========================
+@app.route('/login', methods=['POST'])
+def login():
+    name = request.form['name']
+    password = request.form['password']
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM user WHERE name=? AND password=?", (name, password))
+    user = cursor.fetchone()
+    conn.close()
+
+    if user:
+        session['name'] = name
+        print(f"✅ 로그인 성공: {name}")
+        return redirect('/camera')
+    else:
+        print(f"❌ 로그인 실패: {name}")
+        return "❌ 로그인 실패! 이름 또는 비밀번호를 확인하세요."
+
+# ==========================
+# 회원가입 기능
+# ==========================
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        password = request.form['password']
+        name = request.form['name']
+        phone_number = request.form['phone_number']
+        non_guardian_name = request.form['non_guardian_name']
+        mail = request.form['mail']
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO user (password, name, phone_number, non_guardian_name, mail)
+            VALUES (?, ?, ?, ?, ?)
+        """, (password, name, phone_number, non_guardian_name, mail))
+        conn.commit()
+        conn.close()
+
+        print(f"✅ 회원가입 완료: {name}")
+        return redirect('/')
+    return render_template('register.html')
+
+# ========================
+# 카메라
+# ========================
+@app.route('/camera')
 def index():
     return render_template('camera.html')
 
@@ -122,6 +192,20 @@ def video_feed():
     return Response(gen_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
+# ==========================
+# 낙상 위험 점수 기반 알림 로직 추가
+# ==========================
+def play_alarm_sound():
+    """🔊 서버 스피커에서 경고음 재생"""
+    try:
+        playsound("static/alarmclockbeepsaif.mp3")
+        print("🔊 Alarm sound played!")
+    except Exception as e:
+        print(f"❌ Alarm Sound Error: {e}")
+
+# --------------------------
+# 새로운 위험도 확인 라우트
+# --------------------------
 @app.route('/get_score')
 def get_score():
     conn = sqlite3.connect('capstone2.db')
@@ -129,7 +213,23 @@ def get_score():
     c.execute("SELECT risk_score FROM realtime_screen ORDER BY timestamp DESC LIMIT 1")
     row = c.fetchone()
     conn.close()
+
     score = (row[0] / 100) if row else 0.0
+
+    ### 🔔 추가: 위험 점수 기반으로 문자 및 경고 알림
+    numeric_score = score * 100  # 0~1 → 0~100 단위로 변경
+    user_phone = "+821023902894"  # ⚠️ 사용자 휴대폰 번호 (실제 번호로 수정)
+
+    if numeric_score >= 70:
+        msg = f"🚨 낙상 위험이 매우 높습니다! (위험도: {int(numeric_score)}점)\n즉시 확인이 필요합니다."
+        print("문자 및 경고음 발송 중...")
+        threading.Thread(target=send_sms, args=(user_phone, msg)).start()
+        threading.Thread(target=play_alarm_sound).start()
+    elif numeric_score >= 50:
+        msg = f"⚠️ 낙상 주의: 위험도가 {int(numeric_score)}점입니다. 주의하세요."
+        print("주의 문자 발송 중...")
+        threading.Thread(target=send_sms, args=(user_phone, msg)).start()
+
     return jsonify({'score': score})
 
 @app.route('/shutdown')
@@ -142,6 +242,16 @@ def shutdown():
     if func:
         func()
     return "Server shutting down..."
+
+# 알림 소리 재생
+def play_alarm_sound():
+    try:
+        playsound("static/alarmclockbeepsaif.mp3")
+        print("🔊 Alarm sound played!")
+    except Exception as e:
+        print(f"❌ Alarm Sound Error: {e}")
+
+
 
 # ==========================
 # 서버 실행
