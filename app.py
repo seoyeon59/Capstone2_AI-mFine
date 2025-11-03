@@ -260,6 +260,12 @@ def register():
         conn = get_db_connection()
         cursor = conn.cursor()
 
+        # 서버 측 아이디 중복 체크
+        cursor.execute("SELECT id FROM users WHERE id = ?", (id,))
+        if cursor.fetchone():  # 이미 존재하면
+            conn.close()
+            return render_template('register.html', error_msg="이미 존재하는 아이디입니다.")
+
         # users 테이블에 삽입
         cursor.execute("""
             INSERT INTO users (id, password, username, phone_number, non_guardian_name, mail)
@@ -278,6 +284,22 @@ def register():
         return redirect('/')
 
     return render_template('register.html')
+
+# 아이디어 중복 체크 확인
+@app.route('/check_id')
+def check_id():
+    user_id = request.args.get('id')
+    exists = False
+
+    if user_id:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+        if cursor.fetchone():
+            exists = True
+        conn.close()
+
+    return jsonify({"exists": exists})
 
 # 카메라
 @app.route('/camera')
