@@ -1,4 +1,4 @@
-from flask import Flask, Response, render_template, jsonify, request, redirect, session
+from flask import Flask, Response, render_template, request, redirect, session, jsonify
 import cv2
 import mediapipe as mp
 import pandas as pd
@@ -6,14 +6,15 @@ import sqlite3
 import numpy as np
 import threading
 import time
-from alert_utils import send_sms
+from datetime import datetime
 from playsound import playsound  # pip install playsound==1.2.2
+import os
+import math
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)  # 랜덤값으로 만들기(배포시 수정해야함)
 
-# ==========================
-# SQLite 연결 (회원가입/로그인용)
-# ==========================
+# SQLite 연결
 DB_PATH = 'capstone2.db'
 
 def get_db_connection():
@@ -21,9 +22,7 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row  # 컬럼명을 dict처럼 사용 가능
     return conn
 
-# ==========================
 # MediaPipe Pose 초기화
-# ==========================
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(
     static_image_mode=False,
@@ -34,14 +33,102 @@ pose = mp_pose.Pose(
 )
 
 # 전역 변수 초기화
-data = []
 frame_idx = 0
 latest_frame = None
 frame_lock = threading.Lock()
+prev_angles = {}  # 각도 저장
+prev_angular_velocity = {}  # 각속도 저장
 
-# ==========================
+# 관절 트리플 (a,b,c)
+joint_triplets = [
+    ('neck', 0, 11, 12),
+    ('shoulder_balance', 11, 0, 12),
+    ('shoulder_left', 23, 11, 13),
+    ('shoulder_right', 24, 12, 14),
+    ('elbow_left', 11, 13, 15),
+    ('elbow_right', 12, 14, 16),
+    ('hip_left', 11, 23, 25),
+    ('hip_right', 12, 24, 26),
+    ('knee_left', 23, 25, 27),
+    ('knee_right', 24, 26, 28),
+    ('ankle_left', 25, 27, 31),
+    ('ankle_right', 26, 28, 32),
+    ('torso_left', 0, 11, 23),
+    ('torso_right', 0, 12, 24),
+    ('spine', 0, 23, 24),
+]
+
+# ==============================
+# 실시간 화면 표시와 관련된 함수
+# ==============================
+def compute_angle(a, b, c):
+    """3점 좌표 a,b,c 기준 b를 꼭지점으로 하는 각도 계산"""
+    ba = a - b
+    bc = c - b
+    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-8)
+    angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+    return np.degrees(angle)
+
+# 관절 좌표 -> 각도, 각속도, 각가속도 계산
+def calculate_angles(row, fps=30):
+    """
+    row: dict {관절_x, 관절_y, 관절_z, 관절_v}
+    fps: 프레임 속도
+    return: dict {각도, 각속도, 각가속도}
+    """
+    result = {}
+    for joint_name, a_idx, b_idx, c_idx in joint_triplets:
+        try:
+            a = np.array([row[f'{a_idx}_x'], row[f'{a_idx}_y'], row[f'{a_idx}_z']])
+            b = np.array([row[f'{b_idx}_x'], row[f'{b_idx}_y'], row[f'{b_idx}_z']])
+            c = np.array([row[f'{c_idx}_x'], row[f'{c_idx}_y'], row[f'{c_idx}_z']])
+
+            # 각도
+            angle = compute_angle(a, b, c)
+            result[f'{joint_name}_angle'] = angle
+
+            # 각속도
+            prev_angle = prev_angles.get(f'{joint_name}_angle', angle)
+            angular_velocity = (angle - prev_angle) * fps
+            result[f'{joint_name}_angular_velocity'] = angular_velocity
+
+            # 각가속도
+            prev_vel = prev_angular_velocity.get(f'{joint_name}_angular_velocity', angular_velocity)
+            angular_acceleration = (angular_velocity - prev_vel) * fps
+            result[f'{joint_name}_angular_acceleration'] = angular_acceleration
+
+            # 이전 값 업데이트
+            prev_angles[f'{joint_name}_angle'] = angle
+            prev_angular_velocity[f'{joint_name}_angular_velocity'] = angular_velocity
+
+        except KeyError:
+            # 좌표 없는 경우 0으로 초기화
+            result[f'{joint_name}_angle'] = 0.0
+            result[f'{joint_name}_angular_velocity'] = 0.0
+            result[f'{joint_name}_angular_acceleration'] = 0.0
+
+    return result
+
+# 관절 각도, 각속도, 각가속도 관련 내용 DB 저장 함수 (실시간 + 10분 후 삭제)
+def save_to_db(data_dict):
+    conn = sqlite3.connect('capstone2.db')
+    cursor = conn.cursor()
+
+    # timestamp 포함
+    data_dict['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    columns = ', '.join(data_dict.keys())
+    placeholders = ', '.join(['?'] * len(data_dict))
+    sql = f"INSERT INTO realtime_screen ({columns}) VALUES ({placeholders})"
+    cursor.execute(sql, tuple(data_dict.values()))
+
+    # 10분 이상 지난 데이터 삭제
+    cursor.execute("DELETE FROM realtime_screen WHERE timestamp < datetime('now', '-10 minutes')")
+
+    conn.commit()
+    conn.close()
+
 # DB에서 camera_url 가져오기
-# ==========================
 def get_camera_url(user_id="test"):
     conn = sqlite3.connect('capstone2.db')
     c = conn.cursor()
@@ -53,28 +140,19 @@ def get_camera_url(user_id="test"):
     else:
         return None
 
-# ==========================
 # IP 웹캠 연결
-# ==========================
-# ip_url = "http://192.168.45.3:8080/video" # DB 연결 후 camera table에서 연결하도록 수정할 예정
 ip_url = get_camera_url("test")
 cap = cv2.VideoCapture(ip_url)
 if not cap.isOpened():
     print("[ERROR] IP 웹캠 연결 실패. 영상 스트리밍 불가, 서버는 계속 실행합니다.")
     cap = None # cap이 None이면 gen_frames에서 검은 화면 표시 #
 
-# FPS 설정 (cap이 있는 경우만)
-fps = 30 # 기본값
-if cap is not None:
-    fps_val = cap.get(cv2.CAP_PROP_FPS)
-    if fps_val and fps_val > 0:
-        fps = int(fps_val)
+# FPS 설정
+fps = int(cap.get(cv2.CAP_PROP_FPS)) if cap else 30
 
-# ==========================
 # 프레임 읽기 스레드
-# ==========================
 def capture_frames():
-    global latest_frame, cap, frame_idx, data
+    global latest_frame, cap, frame_idx
     while True:
         if cap is None or not cap.isOpened():
             frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -85,31 +163,33 @@ def capture_frames():
             else:
                 frame = cv2.resize(frame, (640, 480))
 
-                # =======================
-                # MediaPipe 처리 (주석 유지)
-                # =======================
-                # rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # results = pose.process(rgb_frame)
-                # if results.pose_landmarks:
-                #     row = {'frame': frame_idx}
-                #     for i, lm in enumerate(results.pose_landmarks.landmark):
-                #         row[f"x_{i}"] = lm.x
-                #         row[f"y_{i}"] = lm.y
-                #         row[f"z_{i}"] = lm.z
-                #         row[f"v_{i}"] = lm.visibility
-                #     data.append(row)
+                # MediaPipe 처리
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = pose.process(rgb_frame)
 
+                if results.pose_landmarks:
+                    # 관절 좌표 추출
+                    row = {'frame': frame_idx}
+                    for i, lm in enumerate(results.pose_landmarks.landmark):
+                        row[f"x_{i}"] = lm.x
+                        row[f"y_{i}"] = lm.y
+                        row[f"z_{i}"] = lm.z
+                        row[f"v_{i}"] = lm.visibility
+
+                    calculated = calculate_angles(row, fps=fps) # 각도/각속도/각가속도 계산
+                    save_to_db(calculated) # DB 저장
+
+        # 최신 프레임 저장
         with frame_lock:
             latest_frame = frame.copy()
             frame_idx += 1
-        time.sleep(1 / 30)
 
+        time.sleep(1 / 30) # 30 fps
 
+# 스레드 시작
 threading.Thread(target=capture_frames, daemon=True).start()
 
-# ==========================
 # Flask MJPEG 스트리밍
-# ==========================
 def gen_frames():
     global latest_frame
     while True:
@@ -125,87 +205,74 @@ def gen_frames():
 # ==========================
 # Flask 라우팅
 # ==========================
-# ==========================
 # 홈 (로그인 페이지)
-# ==========================
 @app.route('/')
 def home():
     return render_template('login.html')
 
-# ==========================
 # 로그인 기능
-# ==========================
 @app.route('/login', methods=['POST'])
 def login():
-    name = request.form['name']
-    password = request.form['password']
+    user_id = request.form['id']   # id 입력
+    password = request.form['password'] # passord 입력
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM user WHERE name=? AND password=?", (name, password))
+    cursor.execute("SELECT * FROM users WHERE id=? AND password=?", (user_id, password))
     user = cursor.fetchone()
     conn.close()
 
     if user:
-        session['name'] = name
-        print(f"✅ 로그인 성공: {name}")
+        session['user_id'] = user_id
         return redirect('/camera')
     else:
-        print(f"❌ 로그인 실패: {name}")
-        return "❌ 로그인 실패! 이름 또는 비밀번호를 확인하세요."
+        return "이름 또는 비밀번호를 확인하세요."
 
-# ==========================
 # 회원가입 기능
-# ==========================
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
+        id = request.form['id']
         password = request.form['password']
-        name = request.form['name']
+        username = request.form['username']
         phone_number = request.form['phone_number']
         non_guardian_name = request.form['non_guardian_name']
         mail = request.form['mail']
+        camera_url = request.form['camera_url']  # cameras.camera_url
 
         conn = get_db_connection()
         cursor = conn.cursor()
+
+        # users 테이블에 삽입
         cursor.execute("""
-            INSERT INTO user (password, name, phone_number, non_guardian_name, mail)
-            VALUES (?, ?, ?, ?, ?)
-        """, (password, name, phone_number, non_guardian_name, mail))
+            INSERT INTO users (id, password, username, phone_number, non_guardian_name, mail)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (id, password, username, phone_number, non_guardian_name, mail))
+
+        # camera 테이블에 삽입
+        cursor.execute("""
+            INSERT INTO cameras (user_id, camera_url)
+            VALUES (?, ?)
+        """, (id, camera_url))
+
         conn.commit()
         conn.close()
 
-        print(f"✅ 회원가입 완료: {name}")
         return redirect('/')
+
     return render_template('register.html')
 
-# ========================
 # 카메라
-# ========================
 @app.route('/camera')
 def index():
     return render_template('camera.html')
-
 
 @app.route('/video_feed')
 def video_feed():
     return Response(gen_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
-# ==========================
-# 낙상 위험 점수 기반 알림 로직 추가
-# ==========================
-def play_alarm_sound():
-    """🔊 서버 스피커에서 경고음 재생"""
-    try:
-        playsound("static/alarmclockbeepsaif.mp3")
-        print("🔊 Alarm sound played!")
-    except Exception as e:
-        print(f"❌ Alarm Sound Error: {e}")
-
-# --------------------------
 # 새로운 위험도 확인 라우트
-# --------------------------
 @app.route('/get_score')
 def get_score():
     conn = sqlite3.connect('capstone2.db')
@@ -214,43 +281,25 @@ def get_score():
     row = c.fetchone()
     conn.close()
 
-    score = (row[0] / 100) if row else 0.0
+    # 값이 없거나 NaN이면 0으로 처리
+    if row is None or row[0] is None or (isinstance(row[0], float) and math.isnan(row[0])):
+        score = 0.0
+    else:
+        score = row[0] / 100
 
-    ### 🔔 추가: 위험 점수 기반으로 문자 및 경고 알림
-    numeric_score = score * 100  # 0~1 → 0~100 단위로 변경
-    user_phone = "+821023902894"  # ⚠️ 사용자 휴대폰 번호 (실제 번호로 수정)
+    return jsonify({"risk_score": score})
 
-    if numeric_score >= 70:
-        msg = f"🚨 낙상 위험이 매우 높습니다! (위험도: {int(numeric_score)}점)\n즉시 확인이 필요합니다."
-        print("문자 및 경고음 발송 중...")
-        threading.Thread(target=send_sms, args=(user_phone, msg)).start()
-        threading.Thread(target=play_alarm_sound).start()
-    elif numeric_score >= 50:
-        msg = f"⚠️ 낙상 주의: 위험도가 {int(numeric_score)}점입니다. 주의하세요."
-        print("주의 문자 발송 중...")
-        threading.Thread(target=send_sms, args=(user_phone, msg)).start()
+    # 추후에 주의/경고 알림 보내는 코드 추가 예정
 
-    return jsonify({'score': score})
 
-@app.route('/shutdown')
-def shutdown():
-    global data
-    pd.DataFrame(data).to_csv("pose_keypoints.csv", index=False)
-    print("[INFO] CSV 저장 완료 ✅")
-    from flask import request
-    func = request.environ.get('werkzeug.server.shutdown')
-    if func:
-        func()
-    return "Server shutting down..."
-
-# 알림 소리 재생
+# 낙상 위험 점수 기반 알림 로직 추가
 def play_alarm_sound():
+    """🔊 서버 스피커에서 경고음 재생"""
     try:
         playsound("static/alarmclockbeepsaif.mp3")
         print("🔊 Alarm sound played!")
     except Exception as e:
         print(f"❌ Alarm Sound Error: {e}")
-
 
 
 # ==========================
