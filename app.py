@@ -290,9 +290,9 @@ def video_feed():
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 # 모델, 전처리기 미리 불러오기 (Flask 앱 시작 시 한 번)
-scaler = joblib.load("scaler.pkl")
-pca = joblib.load("pca.pkl")
-model = joblib.load("decision_tree_model.pkl")
+scaler = joblib.load("pkl/scaler.pkl")
+pca = joblib.load("pkl/pca.pkl")
+model = joblib.load("pkl/decision_tree_model.pkl")
 
 # 새로운 위험도 확인 라우트 (수정 필요 : 카메라 연결 후 점수 나오게 실행)
 @app.route('/get_score')

@@ -42,6 +42,6 @@ dt = DecisionTreeClassifier(
 dt.fit(X_pca, y)
 
 # 모델 및 전처리 저장
-joblib.dump(scaler, "scaler.pkl")
-joblib.dump(pca, "pca.pkl")
-joblib.dump(dt, "decision_tree_model.pkl")
+joblib.dump(scaler, "pkl/scaler.pkl")
+joblib.dump(pca, "pkl/pca.pkl")
+joblib.dump(dt, "pkl/decision_tree_model.pkl")
