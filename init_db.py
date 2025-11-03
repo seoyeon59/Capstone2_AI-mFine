@@ -23,7 +23,9 @@ CREATE TABLE IF NOT EXISTS cameras (
 );
 
 -- 3️⃣ AI 학습 테이블
+-- 3️⃣ AI 학습 테이블 (PK를 id로 변경)
 CREATE TABLE IF NOT EXISTS ai_learning (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,  -- 새로운 PK
     video TEXT NOT NULL,
     file_id TEXT NOT NULL,
     frame INT NOT NULL,
@@ -124,10 +126,9 @@ CREATE TABLE IF NOT EXISTS ai_learning (
     center_velocity_change FLOAT,
     center_mean_speed FLOAT,
     center_mean_acceleration FLOAT,
-    Label VARCHAR(1),
-
-    PRIMARY KEY (video, file_id, frame)
+    Label VARCHAR(1)
 );
+
 
 -- 4️⃣ 실시간 화면 테이블
 CREATE TABLE IF NOT EXISTS realtime_screen (
@@ -335,6 +336,9 @@ CREATE TABLE IF NOT EXISTS ai_learning (
 
     PRIMARY KEY (video, file_id, frame)
 ) ENGINE=InnoDB;
+
+ALTER TABLE ai_learning
+ADD COLUMN id INTEGER PRIMARY KEY AUTOINCREMENT;
 
 -- 4️⃣ 실시간 화면 테이블
 CREATE TABLE IF NOT EXISTS realtime_screen (

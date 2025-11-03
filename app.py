@@ -1,7 +1,6 @@
 from flask import Flask, Response, render_template, request, redirect, session, jsonify
 import cv2
 import mediapipe as mp
-import pandas as pd
 import sqlite3
 import numpy as np
 import threading
@@ -9,7 +8,8 @@ import time
 from datetime import datetime
 from playsound import playsound  # pip install playsound==1.2.2
 import os
-import math
+import joblib
+import pandas as pd
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)  # 랜덤값으로 만들기(배포시 수정해야함)
@@ -140,19 +140,33 @@ def get_camera_url(user_id="test"):
     else:
         return None
 
-# IP 웹캠 연결
-ip_url = get_camera_url("test")
-cap = cv2.VideoCapture(ip_url)
-if not cap.isOpened():
-    print("[ERROR] IP 웹캠 연결 실패. 영상 스트리밍 불가, 서버는 계속 실행합니다.")
-    cap = None # cap이 None이면 gen_frames에서 검은 화면 표시 #
+# IP 웹캠 연결 반복 시도
+ # 로그인한 id의 웹캠 불러오기
+cap = None  # 전역 카메라 객체
+fps = 30 # 기본 FPS
 
-# FPS 설정
-fps = int(cap.get(cv2.CAP_PROP_FPS)) if cap else 30
+def connect_camera_loop():
+    global cap, fps
+    while True:
+        if cap is None or not cap.isOpened():
+            ip_url = get_camera_url("test")
+            if ip_url:
+                temp_cap = cv2.VideoCapture(ip_url)
+                if temp_cap.isOpened():
+                    cap = temp_cap
+                    fps_val = int(cap.get(cv2.CAP_PROP_FPS))
+                    fps = fps_val if fps_val > 0 else 30
+                    print("[INFO] IP 웹캠 연결 성공")
+                else:
+                    print("[WARN] IP 웹캠 연결 실패, 5초 후 재시도")
+                    temp_cap.release()
+            else:
+                print("[WARN] 로그인 유저 ID 없음 또는 camera_url 없음, 3초 후 재시도")
+        time.sleep(3)
 
 # 프레임 읽기 스레드
 def capture_frames():
-    global latest_frame, cap, frame_idx
+    global latest_frame, cap, frame_idx, fps
     while True:
         if cap is None or not cap.isOpened():
             frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -184,10 +198,7 @@ def capture_frames():
             latest_frame = frame.copy()
             frame_idx += 1
 
-        time.sleep(1 / 30) # 30 fps
-
-# 스레드 시작
-threading.Thread(target=capture_frames, daemon=True).start()
+        time.sleep(1 / fps if fps > 0 else 1 / 30)
 
 # Flask MJPEG 스트리밍
 def gen_frames():
@@ -201,6 +212,12 @@ def gen_frames():
         frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+# =========================
+# 스레드 시작
+# =========================
+threading.Thread(target=connect_camera_loop, daemon=True).start()
+threading.Thread(target=capture_frames, daemon=True).start()
 
 # ==========================
 # Flask 라우팅
@@ -272,20 +289,52 @@ def video_feed():
     return Response(gen_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
-# 새로운 위험도 확인 라우트
+# 모델, 전처리기 미리 불러오기 (Flask 앱 시작 시 한 번)
+scaler = joblib.load("scaler.pkl")
+pca = joblib.load("pca.pkl")
+model = joblib.load("decision_tree_model.pkl")
+
+# 새로운 위험도 확인 라우트 (수정 필요 : 카메라 연결 후 점수 나오게 실행)
 @app.route('/get_score')
 def get_score():
     conn = sqlite3.connect('capstone2.db')
-    c = conn.cursor()
-    c.execute("SELECT risk_score FROM realtime_screen ORDER BY timestamp DESC LIMIT 1")
-    row = c.fetchone()
+    df = pd.read_sql_query("SELECT * FROM realtime_screen ORDER BY timestamp DESC LIMIT 1", conn)
     conn.close()
 
-    # 값이 없거나 NaN이면 0으로 처리
-    if row is None or row[0] is None or (isinstance(row[0], float) and math.isnan(row[0])):
-        score = 0.0
-    else:
-        score = row[0] / 100
+    if df.empty:
+        return jsonify({"risk_score": 0.0})  # 데이터 없으면 0 반환
+
+    # feature 선택
+    feature_cols = [col for col in df.columns if (
+        "angle" in col.lower() or
+        "angular_velocity" in col.lower() or
+        "angular_acceleration" in col.lower()
+    )]
+    X = df[feature_cols]
+
+    # NaN 처리
+    X = X.fillna(0.0)
+
+    # 전처리 + PCA + 예측
+    X_scaled = scaler.transform(X)
+    X_pca = pca.transform(X_scaled)
+    pred = model.predict_proba(X_pca)
+    pred_label = model.predict(X_pca)
+
+    # 예측 결과를 위험 점수로 변환
+    score = pred[0][1] * 100
+    label = int(pred_label[0])  # 0: 정상, 1: 낙상
+
+    # DB에 저장
+    conn = sqlite3.connect('capstone2.db')
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE realtime_screen
+        SET Label = ?, risk_score = ?
+        WHERE timestamp = ?
+    """, (label, score, df['timestamp'].iloc[0]))
+    conn.commit()
+    conn.close()
 
     return jsonify({"risk_score": score})
 
@@ -300,7 +349,6 @@ def play_alarm_sound():
         print("🔊 Alarm sound played!")
     except Exception as e:
         print(f"❌ Alarm Sound Error: {e}")
-
 
 # ==========================
 # 서버 실행
