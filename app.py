@@ -10,9 +10,14 @@ from playsound import playsound  # pip install playsound==1.2.2
 import os
 import joblib
 import pandas as pd
+from pykalman import KalmanFilter
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)  # 랜덤값으로 만들기(배포시 수정해야함)
+
+# AI 모델 로드
+scaler = joblib.load("pkl/scaler.pkl")
+model = joblib.load("pkl/decision_tree_model.pkl")
 
 # SQLite 연결
 DB_PATH = 'capstone2.db'
@@ -36,8 +41,16 @@ pose = mp_pose.Pose(
 frame_idx = 0
 latest_frame = None
 frame_lock = threading.Lock()
+
+# 계산 처리용 전역 변수
 prev_angles = {}  # 각도 저장
 prev_angular_velocity = {}  # 각속도 저장
+prev_center = None
+prev_center_speed = 0.0
+
+# 실시간 처리용 전역 변수
+latest_score = 0.0
+latest_label = "Normal"
 
 # 관절 트리플 (a,b,c)
 joint_triplets = [
@@ -58,9 +71,95 @@ joint_triplets = [
     ('spine', 0, 23, 24),
 ]
 
-# ==============================
-# 실시간 화면 표시와 관련된 함수
-# ==============================
+
+# ----- 중심 이동/속도/각속도 계산 -----
+def compute_center_dynamics(df, fps=30, left_pelvis='kp23', right_pelvis='kp24'):
+    global prev_center, prev_center_speed
+    centers = []
+
+    for _, row in df.iterrows():
+        try:
+            center = np.array([
+                (row[f'{left_pelvis}_x'] + row[f'{right_pelvis}_x']) / 2,
+                (row[f'{left_pelvis}_y'] + row[f'{right_pelvis}_y']) / 2,
+                (row[f'{left_pelvis}_z'] + row[f'{right_pelvis}_z']) / 2
+            ])
+        except KeyError:
+            center = np.array([np.nan, np.nan, np.nan])
+
+        # 속도 / 가속도 계산
+        if prev_center is not None:
+            dist = np.linalg.norm(center - prev_center)
+            speed = dist * fps
+            accel = (speed - prev_center_speed) * fps
+        else:
+            speed, accel = 0.0, 0.0
+
+        centers.append({
+            'center_x': center[0],
+            'center_y': center[1],
+            'center_z': center[2],
+            'center_speed': speed,
+            'center_acceleration': accel
+        })
+
+        prev_center = center
+        prev_center_speed = speed
+
+    return pd.DataFrame(centers)
+
+# ----- 노이즈 제거 : Kalman ------
+def smooth_with_kalman(df, keypoints):
+    df_smooth = df.copy()
+    for kp in keypoints:
+        for axis in ['x', 'y', 'z']:
+            col = f'{kp}_{axis}'
+            if col not in df.columns:
+                continue
+
+            c = df[col].to_numpy()
+            kf = KalmanFilter(initial_state_mean=[c[0], 0],
+                              transition_matrices=[[1, 1], [0, 1]],
+                              observation_matrices=[[1, 0]])
+            state_means, _ = kf.filter(c)
+            df_smooth[col] = state_means[:, 0]
+    return df_smooth
+
+# ----- 중심 정렬 ------
+def centralize_kp(df, pelvis_idx=(23, 24)):
+    df_central = df.copy()
+
+    pelvis_x = (df[f'kp{pelvis_idx[0]}_x'] + df[f'kp{pelvis_idx[1]}_x']) / 2
+    pelvis_y = (df[f'kp{pelvis_idx[0]}_y'] + df[f'kp{pelvis_idx[1]}_y']) / 2
+    pelvis_z = (df[f'kp{pelvis_idx[0]}_z'] + df[f'kp{pelvis_idx[1]}_z']) / 2
+
+    kp_x_cols = [c for c in df.columns if '_x' in c]
+    kp_y_cols = [c for c in df.columns if '_y' in c]
+    kp_z_cols = [c for c in df.columns if '_z' in c]
+
+    for x_col, y_col, z_col in zip(kp_x_cols, kp_y_cols, kp_z_cols):
+        df_central[x_col] -= pelvis_x
+        df_central[y_col] -= pelvis_y
+        df_central[z_col] -= pelvis_z
+
+    return df_central
+
+# ----- 스케일 정규화 -----
+def scale_normalize_kp(df, ref_joints=(23, 24)):
+    df_scaled = df.copy()
+    left_x, left_y, left_z = df[f'kp{ref_joints[0]}_x'], df[f'kp{ref_joints[0]}_y'], df[f'kp{ref_joints[0]}_z']
+    right_x, right_y, right_z = df[f'kp{ref_joints[1]}_x'], df[f'kp{ref_joints[1]}_y'], df[f'kp{ref_joints[1]}_z']
+
+    scale = np.sqrt((left_x - right_x)**2 + (left_y - right_y)**2 + (left_z - right_z)**2)
+    scale[scale == 0] = 1
+
+    for col in df.columns:
+        if any(s in col for s in ['_x', '_y', '_z']):
+            df_scaled[col] = df[col] / scale
+
+    return df_scaled
+
+# ----- 각도 계산 -----
 def compute_angle(a, b, c):
     """3점 좌표 a,b,c 기준 b를 꼭지점으로 하는 각도 계산"""
     ba = a - b
@@ -69,19 +168,16 @@ def compute_angle(a, b, c):
     angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
     return np.degrees(angle)
 
-# 관절 좌표 -> 각도, 각속도, 각가속도 계산
+# ----- 관절 각도/각속도/각가속도 계산 -----
 def calculate_angles(row, fps=30):
-    """
-    row: dict {관절_x, 관절_y, 관절_z, 관절_v}
-    fps: 프레임 속도
-    return: dict {각도, 각속도, 각가속도}
-    """
+    global prev_angles, prev_angular_velocity
     result = {}
+
     for joint_name, a_idx, b_idx, c_idx in joint_triplets:
         try:
-            a = np.array([row[f'{a_idx}_x'], row[f'{a_idx}_y'], row[f'{a_idx}_z']])
-            b = np.array([row[f'{b_idx}_x'], row[f'{b_idx}_y'], row[f'{b_idx}_z']])
-            c = np.array([row[f'{c_idx}_x'], row[f'{c_idx}_y'], row[f'{c_idx}_z']])
+            a = np.array([row[f'kp{a_idx}_x'], row[f'kp{a_idx}_y'], row[f'kp{a_idx}_z']])
+            b = np.array([row[f'kp{b_idx}_x'], row[f'kp{b_idx}_y'], row[f'kp{b_idx}_z']])
+            c = np.array([row[f'kp{c_idx}_x'], row[f'kp{c_idx}_y'], row[f'kp{c_idx}_z']])
 
             # 각도
             angle = compute_angle(a, b, c)
@@ -109,24 +205,32 @@ def calculate_angles(row, fps=30):
 
     return result
 
-# 관절 각도, 각속도, 각가속도 관련 내용 DB 저장 함수 (실시간 + 10분 후 삭제)
+# ----- DB 저장 함수(실시간 + 10분 후 삭제) -----
 def save_to_db(data_dict):
-    conn = sqlite3.connect('capstone2.db')
-    cursor = conn.cursor()
+    try:
+        # SQLite 연결
+        conn = sqlite3.connect('capstone2.db')
+        cursor = conn.cursor()
 
-    # timestamp 포함
-    data_dict['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 현재 시각 추가
+        data_dict['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    columns = ', '.join(data_dict.keys())
-    placeholders = ', '.join(['?'] * len(data_dict))
-    sql = f"INSERT INTO realtime_screen ({columns}) VALUES ({placeholders})"
-    cursor.execute(sql, tuple(data_dict.values()))
+        # 딕셔너리 키/값을 SQL에 삽입
+        columns = ', '.join(data_dict.keys())
+        placeholders = ', '.join(['?'] * len(data_dict))
+        sql = f"INSERT INTO realtime_screen ({columns}) VALUES ({placeholders})"
+        cursor.execute(sql, tuple(data_dict.values()))
 
-    # 10분 이상 지난 데이터 삭제
-    cursor.execute("DELETE FROM realtime_screen WHERE timestamp < datetime('now', '-10 minutes')")
+        # 10분 이상 지난 데이터 삭제 (로컬 타임 기준
+        cursor.execute("DELETE FROM realtime_screen WHERE timestamp < datetime('now', 'localtime', '-10 minutes')")
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+
+    except Exception as e:
+        print("DB 저장 중 오류:", e)
+
+    finally:
+        conn.close()
 
 # DB에서 camera_url 가져오기
 def get_camera_url(user_id="test"):
@@ -164,9 +268,9 @@ def connect_camera_loop():
                 print("[WARN] 로그인 유저 ID 없음 또는 camera_url 없음, 3초 후 재시도")
         time.sleep(3)
 
-# 프레임 읽기 스레드
+# ------ 프레임 읽기 스레드 ------
 def capture_frames():
-    global latest_frame, cap, frame_idx, fps
+    global latest_frame, cap, frame_idx, fps, latest_score, latest_label
     while True:
         if cap is None or not cap.isOpened():
             frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -182,15 +286,73 @@ def capture_frames():
                 results = pose.process(rgb_frame)
 
                 if results.pose_landmarks:
-                    # 관절 좌표 추출
+                    # ----- 관절 좌표 추출-----
                     row = {'frame': frame_idx}
                     for i, lm in enumerate(results.pose_landmarks.landmark):
-                        row[f"x_{i}"] = lm.x
-                        row[f"y_{i}"] = lm.y
-                        row[f"z_{i}"] = lm.z
-                        row[f"v_{i}"] = lm.visibility
+                        row[f'kp{i}_x'] = lm.x
+                        row[f'kp{i}_y'] = lm.y
+                        row[f'kp{i}_z'] = lm.z
+                        row[f'kp{i}_visibility'] = lm.visibility
 
-                    calculated = calculate_angles(row, fps=fps) # 각도/각속도/각가속도 계산
+                    # 한 프레임을 DataFrame 형태로 변환
+                    df = pd.DataFrame([row])
+
+                    # 중심 이동/속도 계산
+                    center_df = compute_center_dynamics(df, fps=fps)
+                    center_info = center_df.iloc[-1].to_dict()
+
+                    # 칼만 필터로 노이즈 제거
+                    keypoints = [f'kp{i}' for i in range(len(results.pose_landmarks.landmark))]
+                    df = smooth_with_kalman(df, keypoints)
+
+                    # 중심 정렬
+                    df = centralize_kp(df, pelvis_idx=(23, 24))
+
+                    # 스케일 정규화
+                    df = scale_normalize_kp(df, ref_joints=(23, 24))
+
+                    # 각도/각속도/각가속도 계산
+                    row_processed = df.iloc[0].to_dict()
+                    calculated = calculate_angles(row_processed, fps=fps)
+
+                    # 중심 이동 정보 병합
+                    calculated.update(center_info)
+
+                    # AI 모델로 예측 수행
+                    try:
+                        # feature 선택
+                        feature_cols = [col for col in calculated.keys() if (
+                                "angle" in col.lower() or
+                                "angular_velocity" in col.lower() or
+                                "angular_acceleration" in col.lower() or
+                                "center" in col.lower()
+                        )]
+
+                        X = pd.DataFrame([[calculated[col] for col in feature_cols]], columns=feature_cols)
+                        X = X.fillna(0.0)
+
+                        # 전처리 + 예측
+                        X_scaled = scaler.transform(X)
+                        pred = model.predict_proba(X_scaled)
+                        pred_label = model.predict(X_scaled)
+
+                        # 예측 결과 반영
+                        score = float(pred[0][1] * 100)
+                        label = int(pred_label[0])
+
+                        calculated["risk_score"] = score
+                        calculated["Label"] = label
+
+                        # 화면 표시용 전역변수 업데이트
+                        latest_score = score
+                        latest_label = "Fall" if label == 1 else "Normal"
+
+                    except Exception as e:
+                        print("⚠️ 실시간 예측 오류:", e)
+                        calculated["risk_score"] = 0.0
+                        calculated["Label"] = 0
+
+                    # DB 저장
                     save_to_db(calculated) # DB 저장
 
         # 최신 프레임 저장
@@ -198,6 +360,7 @@ def capture_frames():
             latest_frame = frame.copy()
             frame_idx += 1
 
+        # FPS 제어
         time.sleep(1 / fps if fps > 0 else 1 / 30)
 
 # Flask MJPEG 스트리밍
@@ -223,11 +386,12 @@ threading.Thread(target=capture_frames, daemon=True).start()
 # Flask 라우팅
 # ==========================
 # 홈 (로그인 페이지)
+# 홈 (로그인 페이지)
 @app.route('/')
 def home():
     return render_template('login.html')
 
-# 로그인 기능
+# ------ 로그인 기능 -------
 @app.route('/login', methods=['POST'])
 def login():
     user_id = request.form['id']   # id 입력
@@ -245,7 +409,7 @@ def login():
     else:
         return "이름 또는 비밀번호를 확인하세요."
 
-# 회원가입 기능
+# ----- 회원가입 기능 ------
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
@@ -285,7 +449,7 @@ def register():
 
     return render_template('register.html')
 
-# 아이디어 중복 체크 확인
+# ------ 아이디어 중복 체크 확인 -------
 @app.route('/check_id')
 def check_id():
     user_id = request.args.get('id')
@@ -301,69 +465,33 @@ def check_id():
 
     return jsonify({"exists": exists})
 
-# 카메라
+# ----- 실시간 화면 및 신고하는 페이지 ------
 @app.route('/camera')
 def index():
     return render_template('camera.html')
 
+# ----- 실시간 화면 ------
 @app.route('/video_feed')
 def video_feed():
     return Response(gen_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
-# 모델, 전처리기 미리 불러오기 (Flask 앱 시작 시 한 번)
-scaler = joblib.load("pkl/scaler.pkl")
-pca = joblib.load("pkl/pca.pkl")
-model = joblib.load("pkl/decision_tree_model.pkl")
 
-# 새로운 위험도 확인 라우트 (수정 필요 : 카메라 연결 후 점수 나오게 실행)
+# ----- 새로운 위험도 확인 라우트 ------
 @app.route('/get_score')
 def get_score():
     conn = sqlite3.connect('capstone2.db')
-    df = pd.read_sql_query("SELECT * FROM realtime_screen ORDER BY timestamp DESC LIMIT 1", conn)
+    df = pd.read_sql_query("SELECT risk_score FROM realtime_screen ORDER BY timestamp DESC LIMIT 1", conn)
     conn.close()
 
     if df.empty:
         return jsonify({"risk_score": 0.0})  # 데이터 없으면 0 반환
 
-    # feature 선택
-    feature_cols = [col for col in df.columns if (
-        "angle" in col.lower() or
-        "angular_velocity" in col.lower() or
-        "angular_acceleration" in col.lower()
-    )]
-    X = df[feature_cols]
-
-    # NaN 처리
-    X = X.fillna(0.0)
-
-    # 전처리 + PCA + 예측
-    X_scaled = scaler.transform(X)
-    X_pca = pca.transform(X_scaled)
-    pred = model.predict_proba(X_pca)
-    pred_label = model.predict(X_pca)
-
-    # 예측 결과를 위험 점수로 변환
-    score = pred[0][1] * 100
-    label = int(pred_label[0])  # 0: 정상, 1: 낙상
-
-    # DB에 저장
-    conn = sqlite3.connect('capstone2.db')
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE realtime_screen
-        SET Label = ?, risk_score = ?
-        WHERE timestamp = ?
-    """, (label, score, df['timestamp'].iloc[0]))
-    conn.commit()
-    conn.close()
-
-    return jsonify({"risk_score": score})
+    return jsonify({"risk_score": round(df['risk_score'].iloc[0], 2)})
 
     # 추후에 주의/경고 알림 보내는 코드 추가 예정
 
-
-# 낙상 위험 점수 기반 알림 로직 추가
+# ----- 낙상 위험 점수 기반 알림 로직 추가 ------
 def play_alarm_sound():
     """🔊 서버 스피커에서 경고음 재생"""
     try:

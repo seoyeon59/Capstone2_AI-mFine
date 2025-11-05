@@ -26,10 +26,7 @@ window.addEventListener("DOMContentLoaded", () => {
       // 실제 모델에서 점수를 가져올 경우 아래 코드 사용
        const response = await fetch("/get_score");
        const data = await response.json();
-       const score = Math.round((data.score || 0) * 100);
-
-      // 테스트용: 랜덤 점수
-//      const score = Math.floor(Math.random() * 101);
+       const score = Math.round((data.risk_score || 0) * 100);
 
       // 숫자 표시
       riskScore.textContent = `${score}%`;
@@ -50,9 +47,7 @@ window.addEventListener("DOMContentLoaded", () => {
   setInterval(fetchRiskScore, 1000);
   fetchRiskScore(); // 초기 실행
 
-  // ==========================
   // 119 신고 팝업
-  // ==========================
   const btn119 = document.getElementById("btn119");
   const popup = document.getElementById("popup");
   const confirmBtn = document.getElementById("confirmBtn");
