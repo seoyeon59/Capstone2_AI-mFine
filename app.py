@@ -100,17 +100,17 @@ def compute_center_dynamics(df, fps=30, left_pelvis='kp23', right_pelvis='kp24')
             acceleration = (speed - prev_center_speed) * fps
             velocity_change = abs(speed - prev_center_speed)
         else:
-            displacement, speed, accel, velocity_change = 0.0, 0.0, 0.0, 0.0
+            displacement, speed, acceleration, velocity_change = 0.0, 0.0, 0.0, 0.0
 
 
         # ✅ DB 스키마에 맞는 필드 구성
         centers.append({
             'center_displacement': displacement,
             'center_speed': speed,
-            'center_acceleration': accel,
+            'center_acceleration': acceleration,
             'center_velocity_change': velocity_change,
             'center_mean_speed': speed,  # 단일 프레임이므로 mean 대신 현재값
-            'center_mean_acceleration': accel
+            'center_mean_acceleration': acceleration
         })
 
         # 이전값 업데이트
