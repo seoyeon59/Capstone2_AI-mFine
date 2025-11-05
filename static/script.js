@@ -26,7 +26,7 @@ window.addEventListener("DOMContentLoaded", () => {
       // 실제 모델에서 점수를 가져올 경우 아래 코드 사용
        const response = await fetch("/get_score");
        const data = await response.json();
-       const score = Math.round((data.risk_score || 0) * 100);
+       const score = Math.round((data.risk_score || 0));
 
       // 숫자 표시
       riskScore.textContent = `${score}%`;

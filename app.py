@@ -87,22 +87,33 @@ def compute_center_dynamics(df, fps=30, left_pelvis='kp23', right_pelvis='kp24')
         except KeyError:
             center = np.array([np.nan, np.nan, np.nan])
 
-        # 속도 / 가속도 계산
-        if prev_center is not None:
-            dist = np.linalg.norm(center - prev_center)
-            speed = dist * fps
-            accel = (speed - prev_center_speed) * fps
-        else:
-            speed, accel = 0.0, 0.0
+        # 초기화
+        displacement = 0.0
+        speed = 0.0
+        acceleration = 0.0
+        velocity_change = 0.0
 
+        # 이전 프레임 대비 거리 변화량 계산
+        if prev_center is not None:
+            displacement = np.linalg.norm(center - prev_center)
+            speed = displacement * fps
+            acceleration = (speed - prev_center_speed) * fps
+            velocity_change = abs(speed - prev_center_speed)
+        else:
+            displacement, speed, accel, velocity_change = 0.0, 0.0, 0.0, 0.0
+
+
+        # ✅ DB 스키마에 맞는 필드 구성
         centers.append({
-            'center_x': center[0],
-            'center_y': center[1],
-            'center_z': center[2],
+            'center_displacement': displacement,
             'center_speed': speed,
-            'center_acceleration': accel
+            'center_acceleration': accel,
+            'center_velocity_change': velocity_change,
+            'center_mean_speed': speed,  # 단일 프레임이므로 mean 대신 현재값
+            'center_mean_acceleration': accel
         })
 
+        # 이전값 업데이트
         prev_center = center
         prev_center_speed = speed
 
@@ -214,6 +225,12 @@ def save_to_db(data_dict):
 
         # 현재 시각 추가
         data_dict['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # center_x/y/z 제거 (DB 컬럼에 없음)
+        filtered_data = {
+            k: v for k, v in data_dict.items()
+            if k not in ['center_x', 'center_y', 'center_z']
+        }
 
         # 딕셔너리 키/값을 SQL에 삽입
         columns = ', '.join(data_dict.keys())
@@ -330,6 +347,9 @@ def capture_frames():
 
                         X = pd.DataFrame([[calculated[col] for col in feature_cols]], columns=feature_cols)
                         X = X.fillna(0.0)
+
+                        # ✅ scaler가 학습할 때 사용한 피처 순서대로 재정렬
+                        X = X.reindex(columns=scaler.feature_names_in_, fill_value=0.0)
 
                         # 전처리 + 예측
                         X_scaled = scaler.transform(X)
