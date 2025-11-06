@@ -19,9 +19,10 @@ app.secret_key = os.urandom(24)  # 랜덤값으로 만들기(배포시 수정해
 scaler = joblib.load("pkl/scaler.pkl")
 model = joblib.load("pkl/decision_tree_model.pkl")
 
-# SQLite 연결
+# DB 연결
 DB_PATH = 'capstone2.db'
 
+# ----- DB 연결 ------
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row  # 컬럼명을 dict처럼 사용 가능
@@ -101,7 +102,6 @@ def compute_center_dynamics(df, fps=30, left_pelvis='kp23', right_pelvis='kp24')
             velocity_change = abs(speed - prev_center_speed)
         else:
             displacement, speed, acceleration, velocity_change = 0.0, 0.0, 0.0, 0.0
-
 
         # ✅ DB 스키마에 맞는 필드 구성
         centers.append({
@@ -238,7 +238,7 @@ def save_to_db(data_dict):
         sql = f"INSERT INTO realtime_screen ({columns}) VALUES ({placeholders})"
         cursor.execute(sql, tuple(data_dict.values()))
 
-        # 10분 이상 지난 데이터 삭제 (로컬 타임 기준
+        # 10분 이상 지난 데이터 삭제 (로컬 타임 기준)
         cursor.execute("DELETE FROM realtime_screen WHERE timestamp < datetime('now', 'localtime', '-10 minutes')")
 
         conn.commit()
@@ -250,7 +250,7 @@ def save_to_db(data_dict):
         conn.close()
 
 # DB에서 camera_url 가져오기
-def get_camera_url(user_id="test"):
+def get_camera_url(user_id):
     conn = sqlite3.connect('capstone2.db')
     c = conn.cursor()
     c.execute("SELECT camera_url FROM cameras WHERE user_id = ?", (user_id,))
@@ -261,16 +261,16 @@ def get_camera_url(user_id="test"):
     else:
         return None
 
-# IP 웹캠 연결 반복 시도
- # 로그인한 id의 웹캠 불러오기
+# 로그인한 id의 웹캠 불러오기
 cap = None  # 전역 카메라 객체
 fps = 30 # 기본 FPS
 
+# ------ IP 웹캠 연결 반복 시도 -------
 def connect_camera_loop():
     global cap, fps
     while True:
         if cap is None or not cap.isOpened():
-            ip_url = get_camera_url("test")
+            ip_url = get_camera_url("test") # id 에 맞는 url넣게 수정
             if ip_url:
                 temp_cap = cv2.VideoCapture(ip_url)
                 if temp_cap.isOpened():
@@ -279,7 +279,7 @@ def connect_camera_loop():
                     fps = fps_val if fps_val > 0 else 30
                     print("[INFO] IP 웹캠 연결 성공")
                 else:
-                    print("[WARN] IP 웹캠 연결 실패, 5초 후 재시도")
+                    print("[WARN] IP 웹캠 연결 실패, 초 후 재시도")
                     temp_cap.release()
             else:
                 print("[WARN] 로그인 유저 ID 없음 또는 camera_url 없음, 3초 후 재시도")
@@ -383,7 +383,7 @@ def capture_frames():
         # FPS 제어
         time.sleep(1 / fps if fps > 0 else 1 / 30)
 
-# Flask MJPEG 스트리밍
+# ------ Flask MJPEG 스트리밍 --------
 def gen_frames():
     global latest_frame
     while True:
@@ -397,7 +397,7 @@ def gen_frames():
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
 # =========================
-# 스레드 시작
+# 스레드 시작 : 수정 X
 # =========================
 threading.Thread(target=connect_camera_loop, daemon=True).start()
 threading.Thread(target=capture_frames, daemon=True).start()
@@ -405,7 +405,6 @@ threading.Thread(target=capture_frames, daemon=True).start()
 # ==========================
 # Flask 라우팅
 # ==========================
-# 홈 (로그인 페이지)
 # 홈 (로그인 페이지)
 @app.route('/')
 def home():
@@ -496,6 +495,14 @@ def video_feed():
     return Response(gen_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
+# ----- 낙상 위험 점수 기반 알림 로직 추가 ------
+def play_alarm_sound():
+    """🔊 서버 스피커에서 경고음 재생"""
+    try:
+        playsound("static/alarmclockbeepsaif.mp3")
+        print("🔊 Alarm sound played!")
+    except Exception as e:
+        print(f"❌ Alarm Sound Error: {e}")
 
 # ----- 새로운 위험도 확인 라우트 ------
 @app.route('/get_score')
@@ -510,15 +517,9 @@ def get_score():
     return jsonify({"risk_score": round(df['risk_score'].iloc[0], 2)})
 
     # 추후에 주의/경고 알림 보내는 코드 추가 예정
-
-# ----- 낙상 위험 점수 기반 알림 로직 추가 ------
-def play_alarm_sound():
-    """🔊 서버 스피커에서 경고음 재생"""
-    try:
-        playsound("static/alarmclockbeepsaif.mp3")
-        print("🔊 Alarm sound played!")
-    except Exception as e:
-        print(f"❌ Alarm Sound Error: {e}")
+    # 경고음 및 주의임 초기 알람 후 간격 시간
+    # 주의 : 최조 주의 알람에서 10분 기준으로 알림 다시 발송
+    # 경고 : 최조 경고 알람 (1번)
 
 # ==========================
 # 서버 실행
