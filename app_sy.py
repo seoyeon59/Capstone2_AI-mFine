@@ -2,16 +2,18 @@ from flask import Flask, Response, render_template, request, redirect, session, 
 import cv2
 import mediapipe as mp
 import sqlite3
+import pymysql
 import numpy as np
 import threading
 import time
 from datetime import datetime
-import pymysql
-from playsound import playsound  # pip install playsound==1.2.2
-import os
-import joblib
 import pandas as pd
+import joblib
 from pykalman import KalmanFilter
+from playsound import playsound
+import yt_dlp
+import os
+from urllib.parse import urlparse, parse_qs
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)  # 랜덤값으로 만들기(배포시 수정해야함)
@@ -342,7 +344,7 @@ def save_to_db(data_dict):
         conn.close()
 '''
 
-# DB에서 camera_url 가져오기
+# ------- DB에서 camera_url 가져오기 -------
 def get_camera_url(user_id):
     conn = sqlite3.connect('capstone2.db')
     c = conn.cursor()
@@ -370,6 +372,43 @@ def get_camera_url(user_id):
         return None
 """
 
+# ------- IP/유튜브 구분 -------
+def get_video_capture(url):
+    if "youtube.com" in url or "youtu.be" in url:
+        try:
+            # yt-dlp 옵션
+            ydl_opts = {
+                'format': 'best[ext=mp4]/best',
+                'quiet': True,
+                'no_warnings': True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info_dict = ydl.extract_info(url, download=False)
+                video_url = info_dict.get("url", None)
+                if video_url:
+                    cap = cv2.VideoCapture(video_url)
+                    if cap.isOpened():
+                        print(f"[INFO] YouTube 연결 성공: {url}")
+                        return cap
+                    else:
+                        print(f"[WARN] YouTube cap 열기 실패: {url}")
+                        return None
+                else:
+                    print(f"[ERROR] YouTube URL 가져오기 실패: {url}")
+                    return None
+        except Exception as e:
+            print(f"[ERROR] YouTube 연결 실패: {e}")
+            return None
+    else:
+        # IP 웹캠
+        cap = cv2.VideoCapture(url)
+        if cap.isOpened():
+            print(f"[INFO] IP 카메라 연결 성공: {url}")
+            return cap
+        else:
+            print(f"[WARN] IP 카메라 연결 실패: {url}")
+            return None
+
 # 로그인한 id의 웹캠 불러오기
 cap = None  # 전역 카메라 객체
 fps = 30 # 기본 FPS
@@ -379,20 +418,21 @@ def connect_camera_loop():
     global cap, fps, current_user_id
     while True:
         if cap is None or not cap.isOpened():
-            if current_user_id:  # 로그인된 유저 ID가 있을 때만
+            if current_user_id:
                 ip_url = get_camera_url(current_user_id)
                 if ip_url:
-                    temp_cap = cv2.VideoCapture(ip_url)
-                    if temp_cap.isOpened():
+                    temp_cap = get_video_capture(ip_url)
+                    if temp_cap and temp_cap.isOpened():
                         cap = temp_cap
                         fps_val = int(cap.get(cv2.CAP_PROP_FPS))
                         fps = fps_val if fps_val > 0 else 30
-                        print("[INFO] IP 웹캠 연결 성공")
+                        print(f"[INFO] 카메라 연결 성공: {ip_url} (FPS: {fps})")
                     else:
-                        print("[WARN] IP 웹캠 연결 실패, 3초 후 재시도")
-                        temp_cap.release()
+                        print(f"[WARN] 카메라 연결 실패, 3초 후 재시도")
+                        if temp_cap:
+                            temp_cap.release()
                 else:
-                    print("[WARN] 로그인 유저 ID 없음 또는 camera_url 없음, 3초 후 재시도")
+                    print("[WARN] camera_url 없음, 3초 후 재시도")
         time.sleep(3)
 """
 # ASW 버전 
@@ -426,8 +466,10 @@ def capture_frames():
         else:
             ret, frame = cap.read()
             if not ret or frame is None:
+                print("[WARN] 프레임 읽기 실패")
                 frame = np.zeros((480, 640, 3), dtype=np.uint8)
             else:
+                print(f"[INFO] 프레임 {frame_idx} 읽음")
                 frame = cv2.resize(frame, (640, 480))
 
                 # MediaPipe 처리
@@ -557,6 +599,7 @@ def login():
 
     if user:
         session['user_id'] = user_id
+        current_user_id = user_id  # 스레드에서 사용 가능
         return redirect('/camera')
     else:
         return "이름 또는 비밀번호를 확인하세요."
@@ -706,7 +749,39 @@ def check_id():
 # ----- 실시간 화면 및 신고하는 페이지 ------
 @app.route('/camera')
 def index():
-    return render_template('camera.html')
+    user_id = session.get('user_id')
+    camera_url = None
+    is_youtube = False
+    embed_url = None
+
+    if user_id:
+        camera_url = get_camera_url(user_id)  # DB에서 가져오기
+        if camera_url:
+            # YouTube URL 확인
+            if "youtube.com" in camera_url or "youtu.be" in camera_url:
+                is_youtube = True
+
+                # embed URL 변환
+                video_id = None
+                if "youtube.com/watch" in camera_url:
+                    query = parse_qs(urlparse(camera_url).query)
+                    video_id = query.get("v", [None])[0]
+                elif "youtu.be" in camera_url:
+                    video_id = camera_url.split("/")[-1]
+                elif "youtube.com/shorts" in camera_url:
+                    video_id = camera_url.split("/")[-1]
+
+                if video_id:
+                    embed_url = f"https://www.youtube.com/embed/{video_id}?autoplay=1"
+                else:
+                    # 영상 ID 못 찾으면 유튜브 처리 취소
+                    is_youtube = False
+                    embed_url = None
+
+    return render_template('camera.html',
+                           camera_url=camera_url,
+                           is_youtube=is_youtube,
+                           embed_url=embed_url)
 
 # ----- 실시간 화면 ------
 @app.route('/video_feed')
