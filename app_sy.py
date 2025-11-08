@@ -6,6 +6,7 @@ import numpy as np
 import threading
 import time
 from datetime import datetime
+import pymysql
 from playsound import playsound  # pip install playsound==1.2.2
 import os
 import joblib
@@ -27,6 +28,26 @@ def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row  # 컬럼명을 dict처럼 사용 가능
     return conn
+"""
+# ASW RDB(MySQL) 버전
+# RDS 연결 정보
+RDS_HOST = "your-rds-endpoint.amazonaws.com"
+RDS_PORT = 3306
+RDS_USER = "username"
+RDS_PASSWORD = "password"
+RDS_DB = "capstone2"
+
+def get_db_connection():
+    conn = pymysql.connect(
+        host=RDS_HOST,
+        port=RDS_PORT,
+        user=RDS_USER,
+        password=RDS_PASSWORD,
+        database=RDS_DB,
+        cursorclass=pymysql.cursors.DictCursor  # dict 형태로 결과 사용 가능
+    )
+    return conn
+"""
 
 # MediaPipe Pose 초기화
 mp_pose = mp.solutions.pose
@@ -42,6 +63,7 @@ pose = mp_pose.Pose(
 frame_idx = 0
 latest_frame = None
 frame_lock = threading.Lock()
+current_user_id = None
 
 # 계산 처리용 전역 변수
 prev_angles = {}  # 각도 저장
@@ -232,14 +254,30 @@ def save_to_db(data_dict):
             if k not in ['center_x', 'center_y', 'center_z']
         }
 
-        # 딕셔너리 키/값을 SQL에 삽입
+        # 딕셔너리 키/값을 SQL에 INSERT
         columns = ', '.join(data_dict.keys())
         placeholders = ', '.join(['?'] * len(data_dict))
         sql = f"INSERT INTO realtime_screen ({columns}) VALUES ({placeholders})"
-        cursor.execute(sql, tuple(data_dict.values()))
+        cursor.execute(sql, tuple(filtered_data.values()))
 
-        # 10분 이상 지난 데이터 삭제 (로컬 타임 기준)
-        cursor.execute("DELETE FROM realtime_screen WHERE timestamp < datetime('now', 'localtime', '-10 minutes')")
+        # user_id별 600개 제한
+        user_id = filtered_data.get('user_id')
+        if user_id:
+            cursor.execute("SELECT COUNT(*) FROM realtime_screen WHERE user_id = ?", (user_id,))
+            count = cursor.fetchone()[0]
+
+            if count > 600:
+                cursor.execute("""
+                    DELETE FROM realtime_screen
+                    WHERE user_id = ?
+                    AND timestamp NOT IN (
+                        SELECT timestamp
+                        FROM realtime_screen
+                        WHERE user_id = ?
+                        ORDER BY datetime(timestamp) DESC
+                        LIMIT 600
+                    )
+                """, (user_id, user_id))
 
         conn.commit()
 
@@ -248,6 +286,61 @@ def save_to_db(data_dict):
 
     finally:
         conn.close()
+'''
+# AWS RDB(MySQL) 버전
+def save_to_db(data_dict):
+    try:
+        # RDS 연결
+        conn = pymysql.connect(
+            host=RDS_HOST,
+            port=RDS_PORT,
+            user=RDS_USER,
+            password=RDS_PASSWORD,
+            database=RDS_DB,
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        cursor = conn.cursor()
+
+        # 현재 시각 추가
+        now = datetime.now()
+        data_dict['timestamp'] = now.strftime("%Y-%m-%d %H:%M:%S")
+
+        # center_x/y/z 제거
+        filtered_data = {k: v for k, v in data_dict.items() if k not in ['center_x', 'center_y', 'center_z']}
+
+        # INSERT 실행
+        columns = ', '.join(filtered_data.keys())
+        placeholders = ', '.join(['%s'] * len(filtered_data))
+        sql = f"INSERT INTO realtime_screen ({columns}) VALUES ({placeholders})"
+        cursor.execute(sql, tuple(filtered_data.values()))
+
+        # user_id별 최신 600개만 유지
+        user_id = filtered_data.get('user_id')
+        if user_id:
+            delete_sql = """
+                DELETE FROM realtime_screen
+                WHERE user_id = %s
+                  AND id NOT IN (
+                      SELECT id
+                      FROM (
+                          SELECT id
+                          FROM realtime_screen
+                          WHERE user_id = %s
+                          ORDER BY timestamp DESC
+                          LIMIT 600
+                      ) AS keep_ids
+                  )
+            """
+            cursor.execute(delete_sql, (user_id, user_id))
+
+        conn.commit()
+
+    except Exception as e:
+        print("⚠️ DB 저장 중 오류:", e)
+
+    finally:
+        conn.close()
+'''
 
 # DB에서 camera_url 가져오기
 def get_camera_url(user_id):
@@ -260,6 +353,22 @@ def get_camera_url(user_id):
         return row[0]
     else:
         return None
+"""
+# AWS RDB 버전
+def get_camera_url(user_id):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT camera_url FROM cameras WHERE user_id = %s", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return row['camera_url']
+        return None
+    except Exception as e:
+        print(f"⚠️ 카메라 URL 조회 오류: {e}")
+        return None
+"""
 
 # 로그인한 id의 웹캠 불러오기
 cap = None  # 전역 카메라 객체
@@ -267,23 +376,46 @@ fps = 30 # 기본 FPS
 
 # ------ IP 웹캠 연결 반복 시도 -------
 def connect_camera_loop():
-    global cap, fps
+    global cap, fps, current_user_id
     while True:
         if cap is None or not cap.isOpened():
-            ip_url = get_camera_url("test1") # id 에 맞는 url넣게 수정
-            if ip_url:
-                temp_cap = cv2.VideoCapture(ip_url)
-                if temp_cap.isOpened():
-                    cap = temp_cap
-                    fps_val = int(cap.get(cv2.CAP_PROP_FPS))
-                    fps = fps_val if fps_val > 0 else 30
-                    print("[INFO] IP 웹캠 연결 성공")
+            if current_user_id:  # 로그인된 유저 ID가 있을 때만
+                ip_url = get_camera_url(current_user_id)
+                if ip_url:
+                    temp_cap = cv2.VideoCapture(ip_url)
+                    if temp_cap.isOpened():
+                        cap = temp_cap
+                        fps_val = int(cap.get(cv2.CAP_PROP_FPS))
+                        fps = fps_val if fps_val > 0 else 30
+                        print("[INFO] IP 웹캠 연결 성공")
+                    else:
+                        print("[WARN] IP 웹캠 연결 실패, 3초 후 재시도")
+                        temp_cap.release()
                 else:
-                    print("[WARN] IP 웹캠 연결 실패, 초 후 재시도")
-                    temp_cap.release()
-            else:
-                print("[WARN] 로그인 유저 ID 없음 또는 camera_url 없음, 3초 후 재시도")
+                    print("[WARN] 로그인 유저 ID 없음 또는 camera_url 없음, 3초 후 재시도")
         time.sleep(3)
+"""
+# ASW 버전 
+def connect_camera_loop():
+    global cap, fps, current_user_id
+    while True:
+        if cap is None or not cap.isOpened():
+            if current_user_id:  # 로그인된 유저만 처리
+                ip_url = get_camera_url(current_user_id)
+                if ip_url:
+                    temp_cap = cv2.VideoCapture(ip_url)
+                    if temp_cap.isOpened():
+                        cap = temp_cap
+                        fps_val = int(cap.get(cv2.CAP_PROP_FPS))
+                        fps = fps_val if fps_val > 0 else 30
+                        print(f"[INFO] {current_user_id} IP 웹캠 연결 성공 (FPS: {fps})")
+                    else:
+                        print(f"[WARN] {current_user_id} IP 웹캠 연결 실패, 3초 후 재시도")
+                        temp_cap.release()
+                else:
+                    print(f"[WARN] {current_user_id} camera_url 없음, 3초 후 재시도")
+        time.sleep(3)
+"""
 
 # ------ 프레임 읽기 스레드 ------
 def capture_frames():
@@ -348,7 +480,7 @@ def capture_frames():
                         X = pd.DataFrame([[calculated[col] for col in feature_cols]], columns=feature_cols)
                         X = X.fillna(0.0)
 
-                        # ✅ scaler가 학습할 때 사용한 피처 순서대로 재정렬
+                        # scaler가 학습할 때 사용한 피처 순서대로 재정렬
                         X = X.reindex(columns=scaler.feature_names_in_, fill_value=0.0)
 
                         # 전처리 + 예측
@@ -413,6 +545,7 @@ def home():
 # ------ 로그인 기능 -------
 @app.route('/login', methods=['POST'])
 def login():
+    global current_user_id
     user_id = request.form['id']   # id 입력
     password = request.form['password'] # passord 입력
 
@@ -427,6 +560,27 @@ def login():
         return redirect('/camera')
     else:
         return "이름 또는 비밀번호를 확인하세요."
+"""
+# ASW 버전
+@app.route('/login', methods=['POST'])
+def login():
+    global current_user_id
+    user_id = request.form['id']
+    password = request.form['password']
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE id=%s AND password=%s", (user_id, password))
+    user = cursor.fetchone()
+    conn.close()
+
+    if user:
+        session['user_id'] = user_id
+        current_user_id = user_id  # 스레드에서 사용 가능
+        return redirect('/camera')
+    else:
+        return "이름 또는 비밀번호를 확인하세요."
+"""
 
 # ----- 회원가입 기능 ------
 @app.route('/register', methods=['GET', 'POST'])
@@ -467,6 +621,55 @@ def register():
         return redirect('/')
 
     return render_template('register.html')
+'''
+# ASW 버전
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        id = request.form['id']
+        password = request.form['password']
+        username = request.form['username']
+        phone_number = request.form['phone_number']
+        non_guardian_name = request.form['non_guardian_name']
+        mail = request.form['mail']
+        camera_url = request.form['camera_url']  # cameras.camera_url
+
+        # AWS RDS 연결
+        conn = pymysql.connect(
+            host=RDS_HOST,
+            port=RDS_PORT,
+            user=RDS_USER,
+            password=RDS_PASSWORD,
+            database=RDS_DB,
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        cursor = conn.cursor()
+
+        # 서버 측 아이디 중복 체크
+        cursor.execute("SELECT id FROM users WHERE id = %s", (id,))
+        if cursor.fetchone():  # 이미 존재하면
+            conn.close()
+            return render_template('register.html', error_msg="이미 존재하는 아이디입니다.")
+
+        # users 테이블에 삽입
+        cursor.execute("""
+            INSERT INTO users (id, password, username, phone_number, non_guardian_name, mail)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (id, password, username, phone_number, non_guardian_name, mail))
+
+        # cameras 테이블에 삽입
+        cursor.execute("""
+            INSERT INTO cameras (user_id, camera_url)
+            VALUES (%s, %s)
+        """, (id, camera_url))
+
+        conn.commit()
+        conn.close()
+
+        return redirect('/')
+
+    return render_template('register.html')
+'''
 
 # ------ 아이디어 중복 체크 확인 -------
 @app.route('/check_id')
@@ -483,6 +686,22 @@ def check_id():
         conn.close()
 
     return jsonify({"exists": exists})
+"""
+@app.route('/check_id')
+def check_id():
+    user_id = request.args.get('id')
+    exists = False
+
+    if user_id:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+        if cursor.fetchone():
+            exists = True
+        conn.close()
+
+    return jsonify({"exists": exists})
+"""
 
 # ----- 실시간 화면 및 신고하는 페이지 ------
 @app.route('/camera')
@@ -507,8 +726,8 @@ def play_alarm_sound():
 # ----- 새로운 위험도 확인 라우트 ------
 @app.route('/get_score')
 def get_score():
-    conn = sqlite3.connect('capstone2.db')
-    df = pd.read_sql_query("SELECT risk_score FROM realtime_screen ORDER BY timestamp DESC LIMIT 1", conn)
+    conn = get_db_connection()
+    df = pd.read_sql("SELECT risk_score FROM realtime_screen ORDER BY timestamp DESC LIMIT 1", conn)
     conn.close()
 
     if df.empty:
@@ -520,6 +739,23 @@ def get_score():
     # 경고음 및 주의임 초기 알람 후 간격 시간
     # 주의 : 최조 주의 알람에서 10분 기준으로 알림 다시 발송
     # 경고 : 최조 경고 알람 (1번)
+
+"""
+# ASW 버전
+@app.route('/get_score')
+def get_score():
+    conn = get_db_connection()
+    df = pd.read_sql_query(
+        "SELECT risk_score FROM realtime_screen ORDER BY timestamp DESC LIMIT 1",
+        conn
+    )
+    conn.close()
+
+    if df.empty:
+        return jsonify({"risk_score": 0.0})  # 데이터 없으면 0 반환
+
+    return jsonify({"risk_score": round(df['risk_score'].iloc[0], 2)})
+"""
 
 # ==========================
 # 서버 실행
