@@ -198,6 +198,7 @@ conn.commit()
 conn.close()
 
 """
+
 # AWS 버전
 import pymysql
 # ------------------------------
@@ -241,7 +242,7 @@ sql_statements = [
     CREATE TABLE IF NOT EXISTS users (
         id VARCHAR(50) PRIMARY KEY,
         password VARCHAR(255) NOT NULL,
-        username VARCHAR(100) NOT NULL UNIQUE,
+        username VARCHAR(100) NOT NULL,
         phone_number BIGINT NOT NULL,
         non_guardian_name VARCHAR(255) NOT NULL,
         mail VARCHAR(255)
@@ -257,7 +258,7 @@ sql_statements = [
     ) ENGINE=InnoDB;
     """,
 
-    # 3️⃣ AI 학습 테이블 (MySQL 버전)
+    # 3️⃣ AI 학습 테이블
     """
     CREATE TABLE IF NOT EXISTS ai_learning (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -430,15 +431,12 @@ sql_statements = [
 ]
 
 # ------------------------------
-# 3️⃣ 실행
+# 실행
 # ------------------------------
 for stmt in sql_statements:
     cur.execute(stmt)
 
-print("✅ All tables created successfully in AWS RDS (MySQL)!")
+print("✅ All tables created successfully in MySQL!")
 
-# ------------------------------
-# 4️⃣ 연결 종료
-# ------------------------------
 cur.close()
 conn.close()
