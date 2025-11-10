@@ -4,36 +4,76 @@
   <meta charset="UTF-8">
   <title>회원가입</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='register_style.css') }}">
+  <style>
+    #registerForm input {
+      display: block;
+      margin-bottom: 12px;
+      padding: 8px;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    #registerForm button {
+      width: 100%;
+      padding: 10px 0;
+    }
+  </style>
 </head>
 <body>
   <div class="register-container">
-    <h2>회원가입</h2>
-    <p>새로운 계정을 만들어 카메라에 연결하세요</p>
-    <form action="/register" method="POST">
-      <input type="text" id="userId" name="id" placeholder="사용자 ID" required>
-      <div id="userIdError" style="display:none; color:red; font-size:12px;">
-        이미 존재하는 아이디입니다.
+
+    <!-- ✅ 개인정보 안내 및 동의 영역 -->
+    <div id="privacySection">
+      <h2>회원가입</h2>
+      <p>새로운 계정을 만들어 카메라에 연결하세요</p>
+      <div style="border: 1px solid #ccc; padding: 8px; height: 100px; overflow-y: auto; font-size: 13px; margin-bottom: 4px;">
+        <strong>개인정보 수집 및 이용 안내</strong>
+        <p>
+          본 서비스는 회원가입, 서비스 제공 및 안전 관리를 위해 다음과 같은 개인정보를 수집합니다.<br>
+          수집 항목: 사용자 ID, 비밀번호, 보호자 이름, 전화번호, 피보호자 이름, 카메라 URL, 이메일 등<br>
+          수집 목적: 계정 관리, 서비스 제공, 보안 및 모니터링 목적<br>
+          개인정보는 목적 달성 후 안전하게 파기되며, 제3자에게 제공되지 않습니다.
+        </p>
       </div>
 
-      <input type="text" name="username" placeholder="보호자 이름" required>
-      <input type="text" name="phone_number" placeholder="보호자 전화번호" required>
-      <input type="text" name="non_guardian_name" placeholder="피보호자 이름" required>
-      <input type="text" name="camera_url" placeholder="카메라 URL" required>
-      <input type="email" name="mail" placeholder="이메일" required>
+      <label style="display:flex; align-items:center; margin-bottom:12px; font-size:14px;">
+        <input type="checkbox" id="agreePrivacy" style="margin-right:6px;">
+        개인정보 수집 및 이용에 동의합니다.
+      </label>
+      <div id="privacyError" style="display:none; color:red; font-size:12px; margin-top:4px;">
+        개인정보 동의를 진행해주세요.
+      </div>
+    </div>
 
-      <input type="password" id="password" name="password" placeholder="비밀번호" required>
-      <input type="password" id="passwordConfirm" placeholder="비밀번호 확인" required>
-      <div id="passwordError" class="error">비밀번호가 일치하지 않습니다.</div>
+    <!-- ✅ 회원가입 폼 (처음엔 숨김) -->
+    <div id="registerForm" style="display:none;">
+      <h2>회원가입</h2>
+      <p>새로운 계정을 만들어 카메라에 연결하세요</p>
 
-      <button type="submit">회원가입</button>
-    </form>
+      <form action="/register" method="POST">
+        <input type="text" id="userId" name="id" placeholder="사용자 ID" required>
+        <div id="userIdError" style="display:none; color:red; font-size:12px;">이미 존재하는 아이디입니다.</div>
 
-    <div class="login">
-      이미 계정이 있으신가요? <a href="/">로그인하기</a>
+        <input type="text" name="username" placeholder="보호자 이름" required>
+        <input type="text" name="phone_number" placeholder="보호자 전화번호" required>
+        <input type="text" name="non_guardian_name" placeholder="피보호자 이름" required>
+        <input type="text" name="camera_url" placeholder="카메라 URL" required>
+        <input type="email" name="mail" placeholder="이메일" required>
+
+        <input type="password" id="password" name="password" placeholder="비밀번호" required>
+        <input type="password" id="passwordConfirm" placeholder="비밀번호 확인" required>
+        <div id="passwordError" style="display: none; color: red;">비밀번호가 일치하지 않습니다.</div>
+
+        <div style="margin-top: 16px;">
+          <button type="submit">회원가입</button>
+        </div>
+      </form>
+
+      <div class="login" style="margin-top:12px;">
+        이미 계정이 있으신가요? <a href="/">로그인하기</a>
+      </div>
     </div>
   </div>
 
-  <!-- JS 파일 불러오기 -->
   <script src="{{ url_for('static', filename='register.js') }}"></script>
 </body>
 </html>
