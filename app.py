@@ -426,7 +426,8 @@ def login():
         session['user_id'] = user_id
         return redirect('/camera')
     else:
-        return "이름 또는 비밀번호를 확인하세요."
+        # 로그인 실패 시 로그인 페이지 다시 렌더링 + 에러 메시지 전달
+        return render_template('login.html', error_msg="아이디 또는 비밀번호를 확인하세요.")
 
 # ----- 회원가입 기능 ------
 @app.route('/register', methods=['GET', 'POST'])
