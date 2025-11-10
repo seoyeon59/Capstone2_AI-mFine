@@ -8,6 +8,7 @@ document.addEventListener('DOMContentLoaded', function() {
   const userIdError = document.getElementById('userIdError');
   const password = document.getElementById('password');
   const passwordConfirm = document.getElementById('passwordConfirm');
+  const passwordFormatError = document.getElementById('passwordFormatError');
   const passwordError = document.getElementById('passwordError');
 
   let isIdTaken = false;
@@ -55,6 +56,26 @@ document.addEventListener('DOMContentLoaded', function() {
       isIdTaken = true;
     }
   });
+
+  // 비밀번호 형식 체크
+  function checkPasswordFormat() {
+    const value = password.value;
+    const isValid = /^(?=.*[A-Za-z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]).{8,}$/.test(value);
+
+    if (value === "" || isValid) {
+      passwordFormatError.style.display = 'none';
+    } else {
+      passwordFormatError.textContent = "비밀번호가 형식에 맞지 않습니다.";
+      passwordFormatError.style.display = 'block';
+    }
+  }
+
+  // 실시간 체크 연결
+  password.addEventListener('input', function() {
+    checkPasswordMatch();
+    checkPasswordFormat();
+  });
+  passwordConfirm.addEventListener('input', checkPasswordMatch);
 
   // 비밀번호 일치 실시간 체크
   function checkPasswordMatch() {

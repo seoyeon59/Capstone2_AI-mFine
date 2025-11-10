@@ -59,9 +59,12 @@
         <input type="text" name="camera_url" placeholder="카메라 URL" required>
         <input type="email" name="mail" placeholder="이메일" required>
 
+        <small style="color:#888; font-size:12px; margin-top:2px; display:block;">* 비밀번호는 8자 이상, 영문·숫자·특수문자 조합을 권장합니다.</small>
         <input type="password" id="password" name="password" placeholder="비밀번호" required>
+        <div id="passwordFormatError" style="display:none; color:red; font-size:12px; margin-top:-4px;">비밀번호가 형식에 맞지 않습니다.</div>
+
         <input type="password" id="passwordConfirm" placeholder="비밀번호 확인" required>
-        <div id="passwordError" style="display: none; color: red;">비밀번호가 일치하지 않습니다.</div>
+        <div id="passwordError" style="display: none; color: red; font-size:12px; margin-top:-4px;">비밀번호가 일치하지 않습니다.</div>
 
         <div style="margin-top: 16px;">
           <button type="submit">회원가입</button>
