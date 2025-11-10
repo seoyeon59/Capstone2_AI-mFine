@@ -1,7 +1,7 @@
 from flask import Flask, Response, render_template, request, redirect, session, jsonify
 import cv2
 import mediapipe as mp
-import sqlite3
+# import sqlite3
 import pymysql
 import numpy as np
 import threading
