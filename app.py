@@ -378,102 +378,103 @@ def connect_camera_loop():
 # ------ 프레임 읽기 스레드 ------
 def capture_frames():
     global latest_frame, cap, frame_idx, fps, latest_score, latest_label
+    print("[INFO] capture_frames 스레드 시작")
+
+    fail_count = 0
+
     while True:
         if cap is None or not cap.isOpened():
             frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        else:
+            time.sleep(0.2)
+            continue
+
+        try:
+            # ✅ 안정형: grab을 과도하게 하지 않음
+            # (YouTube는 grab() 반복 시 연결이 끊김)
             ret, frame = cap.read()
+
             if not ret or frame is None:
-                print("[WARN] 프레임 읽기 실패")
-                frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            else:
-                print(f"[INFO] 프레임 {frame_idx} 읽음")
-                frame = cv2.resize(frame, (640, 480))
+                fail_count += 1
+                print(f"[WARN] 프레임 읽기 실패 ({fail_count})")
+                if fail_count > 10:
+                    print("[ERROR] 스트림이 끊긴 것으로 판단, 재연결 시도 예정")
+                    cap.release()
+                    cap = None
+                time.sleep(0.1)
+                continue
+            fail_count = 0
 
-                # MediaPipe 처리
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = pose.process(rgb_frame)
+            # 프레임 리사이즈
+            frame = cv2.resize(frame, (640, 480))
 
-                if results.pose_landmarks:
-                    # ----- 관절 좌표 추출-----
-                    row = {'frame': frame_idx}
-                    for i, lm in enumerate(results.pose_landmarks.landmark):
-                        row[f'kp{i}_x'] = lm.x
-                        row[f'kp{i}_y'] = lm.y
-                        row[f'kp{i}_z'] = lm.z
-                        row[f'kp{i}_visibility'] = lm.visibility
+            # MediaPipe Pose 처리
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = pose.process(rgb_frame)
 
-                    # 한 프레임을 DataFrame 형태로 변환
-                    df = pd.DataFrame([row])
+            if results.pose_landmarks:
+                row = {'frame': frame_idx}
+                for i, lm in enumerate(results.pose_landmarks.landmark):
+                    row[f'kp{i}_x'] = lm.x
+                    row[f'kp{i}_y'] = lm.y
+                    row[f'kp{i}_z'] = lm.z
+                    row[f'kp{i}_visibility'] = lm.visibility
 
-                    # 중심 이동/속도 계산
-                    center_df = compute_center_dynamics(df, fps=fps)
-                    center_info = center_df.iloc[-1].to_dict()
+                df = pd.DataFrame([row])
+                center_df = compute_center_dynamics(df, fps=fps)
+                center_info = center_df.iloc[-1].to_dict()
 
-                    # 칼만 필터로 노이즈 제거
-                    keypoints = [f'kp{i}' for i in range(len(results.pose_landmarks.landmark))]
-                    df = smooth_with_kalman(df, keypoints)
+                keypoints = [f'kp{i}' for i in range(len(results.pose_landmarks.landmark))]
+                df = smooth_with_kalman(df, keypoints)
+                df = centralize_kp(df, pelvis_idx=(23, 24))
+                df = scale_normalize_kp(df, ref_joints=(23, 24))
 
-                    # 중심 정렬
-                    df = centralize_kp(df, pelvis_idx=(23, 24))
+                row_processed = df.iloc[0].to_dict()
+                calculated = calculate_angles(row_processed, fps=fps)
+                calculated.update(center_info)
 
-                    # 스케일 정규화
-                    df = scale_normalize_kp(df, ref_joints=(23, 24))
+                try:
+                    feature_cols = [col for col in calculated.keys() if (
+                        "angle" in col.lower() or
+                        "angular_velocity" in col.lower() or
+                        "angular_acceleration" in col.lower() or
+                        "center" in col.lower()
+                    )]
 
-                    # 각도/각속도/각가속도 계산
-                    row_processed = df.iloc[0].to_dict()
-                    calculated = calculate_angles(row_processed, fps=fps)
+                    X = pd.DataFrame([[calculated[col] for col in feature_cols]], columns=feature_cols).fillna(0.0)
+                    X = X.reindex(columns=scaler.feature_names_in_, fill_value=0.0)
 
-                    # 중심 이동 정보 병합
-                    calculated.update(center_info)
+                    X_scaled = scaler.transform(X)
+                    pred = model.predict_proba(X_scaled)
+                    pred_label = model.predict(X_scaled)
 
-                    # AI 모델로 예측 수행
-                    try:
-                        # feature 선택
-                        feature_cols = [col for col in calculated.keys() if (
-                                "angle" in col.lower() or
-                                "angular_velocity" in col.lower() or
-                                "angular_acceleration" in col.lower() or
-                                "center" in col.lower()
-                        )]
+                    score = float(pred[0][1] * 100)
+                    label = int(pred_label[0])
 
-                        X = pd.DataFrame([[calculated[col] for col in feature_cols]], columns=feature_cols)
-                        X = X.fillna(0.0)
+                    calculated["risk_score"] = score
+                    calculated["Label"] = label
+                    latest_score = score
+                    latest_label = "Fall" if label == 1 else "Normal"
 
-                        # scaler가 학습할 때 사용한 피처 순서대로 재정렬
-                        X = X.reindex(columns=scaler.feature_names_in_, fill_value=0.0)
+                except Exception as e:
+                    print("⚠️ 실시간 예측 오류:", e)
+                    calculated["risk_score"] = 0.0
+                    calculated["Label"] = 0
 
-                        # 전처리 + 예측
-                        X_scaled = scaler.transform(X)
-                        pred = model.predict_proba(X_scaled)
-                        pred_label = model.predict(X_scaled)
+                # DB 저장
+                save_to_db(calculated)
 
-                        # 예측 결과 반영
-                        score = float(pred[0][1] * 100)
-                        label = int(pred_label[0])
+            # 최신 프레임 저장 (lock으로 보호)
+            with frame_lock:
+                latest_frame = frame.copy()
+                frame_idx += 1
 
-                        calculated["risk_score"] = score
-                        calculated["Label"] = label
+        except Exception as e:
+            print(f"[ERROR] capture_frames 예외 발생: {e}")
+            time.sleep(0.2)
 
-                        # 화면 표시용 전역변수 업데이트
-                        latest_score = score
-                        latest_label = "Fall" if label == 1 else "Normal"
+        # FPS 제어: 너무 빠르면 CPU 과다, 너무 느리면 딜레이
+        time.sleep(1 / fps if fps > 0 else 1 / 25)
 
-                    except Exception as e:
-                        print("⚠️ 실시간 예측 오류:", e)
-                        calculated["risk_score"] = 0.0
-                        calculated["Label"] = 0
-
-                    # DB 저장
-                    save_to_db(calculated) # DB 저장
-
-        # 최신 프레임 저장
-        with frame_lock:
-            latest_frame = frame.copy()
-            frame_idx += 1
-
-        # FPS 제어
-        time.sleep(1 / fps if fps > 0 else 1 / 30)
 
 # ------ Flask MJPEG 스트리밍 : 수정 제안 --------
 empty_frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -503,7 +504,7 @@ def gen_frames():
 
         except Exception as e:
             print(f"[ERROR] gen_frames 예외 발생: {e}")
-            time.sleep(0.1)
+            time.sleep(0.005)
 
 # ==========================
 # Flask 라우팅
