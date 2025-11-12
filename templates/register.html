@@ -23,25 +23,89 @@
 
     <!-- ✅ 개인정보 안내 및 동의 영역 -->
     <div id="privacySection">
-      <h2>회원가입</h2>
-      <p>새로운 계정을 만들어 카메라에 연결하세요</p>
-      <div style="border: 1px solid #ccc; padding: 8px; height: 100px; overflow-y: auto; font-size: 13px; margin-bottom: 4px;">
-        <strong>개인정보 수집 및 이용 안내</strong>
+      <h2>동의 항목 (필수)</h2>
+      <p>이용 약관에 동의해야 가입 가능합니다.</p>
+      <div style="border: 1px solid #ccc; padding: 8px; max-height: 150px; overflow-y: auto; font-size: 13px; margin-bottom: 4px; box-sizing: border-box;">
+        <strong>1. 개인정보 수집 및 이용 안내</strong>
         <p>
-          본 서비스는 회원가입, 서비스 제공 및 안전 관리를 위해 다음과 같은 개인정보를 수집합니다.<br>
-          수집 항목: 사용자 ID, 비밀번호, 보호자 이름, 전화번호, 피보호자 이름, 카메라 URL, 이메일 등<br>
-          수집 목적: 계정 관리, 서비스 제공, 보안 및 모니터링 목적<br>
-          개인정보는 목적 달성 후 안전하게 파기되며, 제3자에게 제공되지 않습니다.
+          수집 목적: 회원 식별, 로그인, 서비스 제공, 고객 지원 <br>
+          수집 항목: 이름, 아이디, 비밀번호, 이메일, 전화번호, 보호자 정보(필요 시) <br>
+          보관 기간: 회원 탈퇴 시까지 <br>
+          안내: 제공하신 개인정보는 서비스 이용 외 다른 목적으로 사용되지 않습니다.
+        </p>
+      </div>
+
+
+      <!-- 민감정보/건강 정보 처리 동의 -->
+      <div style="border: 1px solid #ccc; padding: 8px; height: 100px; overflow-y: auto; font-size: 13px; margin-bottom: 4px;">
+        <strong>2. 민감정보/건강 정보 처리 동의</strong>
+        <p>
+          수집 목적: 실시간 낙상 위험 감지, AI 분석, 알람 제공 <br>
+          수집 항목: 실시간 영상, 관절/움직임 데이터, 낙상 위험 점수 <br>
+          안내: 영상과 행동 데이터는 서버에서 안전하게 저장 및 처리되며, 외부로 공개되지 않습니다.
+        </p>
+      </div>
+
+
+      <!-- 영상/데이터 활용 동의 -->
+      <div style="border: 1px solid #ccc; padding: 8px; height: 100px; overflow-y: auto; font-size: 13px; margin-bottom: 4px;">
+        <strong>3. 영상/데이터 활용 동의</strong>
+        <p>
+          활용 목적: AI 모델 학습, 서비스 개선, 연구 목적 <br>
+          내용: 수집된 데이터는 익명화 후 통계적 분석 또는 모델 개선 용도로만 사용됩니다. <br>
+          선택권 안내: 동의하지 않아도 기본 서비스 이용에는 제한이 없습니다.
+        </p>
+      </div>
+
+
+      <!-- 제3자 제공 동의 -->
+      <div style="border: 1px solid #ccc; padding: 8px; height: 100px; overflow-y: auto; font-size: 13px; margin-bottom: 4px;">
+        <strong>4. 제3자 제공 동의</strong>
+        <p>
+          제공 대상: 앱푸시 서비스 제공사, 보호자 알림, 연구 기관 등 <br>
+          제공 목적: 위험 알람 전송, 서비스 개선, 연구 분석 <br>
+          안내: 동의하지 않아도 기본 서비스 이용에는 제한이 없습니다.
+        </p>
+      </div>
+
+
+      <!-- 서비스 이용약관 동의 -->
+      <div style="border: 1px solid #ccc; padding: 8px; height: 100px; overflow-y: auto; font-size: 13px; margin-bottom: 4px;">
+        <strong>5. 서비스 이용약관 동의</strong>
+        <p>
+          주요 내용: <br>
+          1. 앱푸시 알람은 참고용이며, 실제 위험 판단과 대응은 사용자 책임 <br>
+          2. 서비스 이용 중 발생하는 사고에 대해 회사는 책임을 지지 않음 <br>
+          3. 서비스 이용 규칙, 금지 사항 안내
+        </p>
+      </div>
+
+
+      <!-- 앱푸시/마케팅 수신 동의 -->
+      <div style="border: 1px solid #ccc; padding: 8px; max_height: 50px; overflow-y: auto; font-size: 13px; margin-bottom: 4px;">
+        <strong>6. 앱푸시/마케팅 수신 동의</strong>
+        <p>
+          내용: 낙상 위험 알림, 긴급 알림, 이벤트/프로모션 정보 제공 <br>
+          선택권 안내: 동의하지 않아도 기본 낙상 위험 알람 서비스 이용에는 제한 없음
+        </p>
+      </div>
+
+
+      <!-- 개인정보 열람/수정/삭제 안내 -->
+      <div style="border: 1px solid #ccc; padding: 8px; max_height: 200px; overflow-y: auto; font-size: 13px; margin-bottom: 4px;">
+        <strong>7. 개인정보 열람/수정/삭제 안내</strong>
+        <p>
+          내용: <br>
+          1. 회원은 언제든지 자신의 개인정보 열람, 수정, 삭제를 요청할 수 있습니다. <br>
+          2. 탈퇴 시 개인정보는 안전하게 파기됩니다. <br>
+          3. 문의: 고객센터 이메일 또는 전화번호
         </p>
       </div>
 
       <label style="display:flex; align-items:center; margin-bottom:12px; font-size:14px;">
-        <input type="checkbox" id="agreePrivacy" style="margin-right:6px;">
-        개인정보 수집 및 이용에 동의합니다.
+        <input type="checkbox" id="agreeAll" style="margin-right:6px;">
+        모든 내용을 이해했으며, 전체 동의합니다.
       </label>
-      <div id="privacyError" style="display:none; color:red; font-size:12px; margin-top:4px;">
-        개인정보 동의를 진행해주세요.
-      </div>
     </div>
 
     <!-- ✅ 회원가입 폼 (처음엔 숨김) -->

@@ -1,8 +1,9 @@
 document.addEventListener('DOMContentLoaded', function() {
-  const privacySection = document.getElementById('privacySection');
-  const agreePrivacy = document.getElementById('agreePrivacy');
-  const privacyError = document.getElementById('privacyError');
   const registerFormDiv = document.getElementById('registerForm');
+  const privacySection = document.getElementById('privacySection');
+  const agreeAll = document.getElementById('agreeAll');
+  const agreeError = document.getElementById('agreeError');
+
   const form = registerFormDiv.querySelector('form');
   const userIdInput = document.getElementById('userId');
   const userIdError = document.getElementById('userIdError');
@@ -13,113 +14,97 @@ document.addEventListener('DOMContentLoaded', function() {
 
   let isIdTaken = false;
 
-  // 개인정보 동의 체크 시 폼 표시 & 안내 숨김
-  agreePrivacy.addEventListener('change', function() {
-    if (agreePrivacy.checked) {
+  // -------------------- 전체 동의 체크 시 폼 표시 --------------------
+  agreeAll.addEventListener('change', () => {
+    if (agreeAll.checked) {
       registerFormDiv.style.display = 'block';
       privacySection.style.display = 'none';
-      privacyError.style.display = 'none';
+      agreeError.style.display = 'none';
     } else {
       registerFormDiv.style.display = 'none';
     }
   });
 
-  // 아이디 중복 체크
+  // -------------------- 아이디 중복 체크 --------------------
   userIdInput.addEventListener('blur', async function() {
     const userId = userIdInput.value.trim();
     if (!userId) {
-      userIdError.style.display = 'none';
-      userIdInput.classList.remove('error-input');
-      isIdTaken = false;
+      hideUserIdError();
       return;
     }
 
     try {
       const response = await fetch(`/check_id?id=${encodeURIComponent(userId)}`);
+
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
       const data = await response.json();
 
-      if (data.exists) {
-        userIdError.textContent = "이미 존재하는 아이디입니다.";
-        userIdError.style.display = 'block';
-        userIdInput.classList.add('error-input');
-        isIdTaken = true;
-      } else {
-        userIdError.style.display = 'none';
-        userIdInput.classList.remove('error-input');
-        isIdTaken = false;
-      }
+      if (data.exists) showUserIdError("이미 존재하는 아이디입니다.");
+      else hideUserIdError();
     } catch (err) {
       console.error(err);
-      userIdError.textContent = "아이디 확인 중 오류 발생";
-      userIdError.style.display = 'block';
-      userIdInput.classList.add('error-input');
-      isIdTaken = true;
+      showUserIdError("아이디 확인 중 오류 발생");
     }
   });
 
-  // 비밀번호 형식 체크
+  function showUserIdError(msg) {
+    userIdError.textContent = msg;
+    userIdError.style.display = 'block';
+    userIdInput.classList.add('error-input');
+    isIdTaken = true;
+  }
+
+  function hideUserIdError() {
+    userIdError.style.display = 'none';
+    userIdInput.classList.remove('error-input');
+    isIdTaken = false;
+  }
+
+  // -------------------- 비밀번호 체크 --------------------
   function checkPasswordFormat() {
     const value = password.value;
     const isValid = /^(?=.*[A-Za-z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]).{8,}$/.test(value);
-
-    if (value === "" || isValid) {
-      passwordFormatError.style.display = 'none';
-    } else {
-      passwordFormatError.textContent = "비밀번호가 형식에 맞지 않습니다.";
-      passwordFormatError.style.display = 'block';
-    }
+    passwordFormatError.style.display = (value && !isValid) ? 'block' : 'none';
+    return isValid;
   }
 
-  // 실시간 체크 연결
-  password.addEventListener('input', function() {
-    checkPasswordMatch();
-    checkPasswordFormat();
-  });
-  passwordConfirm.addEventListener('input', checkPasswordMatch);
-
-  // 비밀번호 일치 실시간 체크
   function checkPasswordMatch() {
-    if (passwordConfirm.value === "") {
-      passwordError.style.display = 'none';
-      return;
-    }
-
-    if (password.value !== passwordConfirm.value) {
-      passwordError.textContent = "비밀번호가 일치하지 않습니다.";
-      passwordError.style.display = 'block';
-    } else {
-      passwordError.style.display = 'none';
-    }
+    const match = password.value === passwordConfirm.value;
+    passwordError.style.display = (!match && passwordConfirm.value) ? 'block' : 'none';
+    return match;
   }
 
-  password.addEventListener('input', checkPasswordMatch);
+  password.addEventListener('input', () => {
+    checkPasswordFormat();
+    checkPasswordMatch();
+  });
+
   passwordConfirm.addEventListener('input', checkPasswordMatch);
 
-  // 폼 제출 시 체크
-  form.addEventListener('submit', async function(event) {
-    event.preventDefault();
-
+  // -------------------- 폼 제출 --------------------
+  form.addEventListener('submit', function(event) {
     let preventSubmit = false;
 
-    if (!agreePrivacy.checked) {
-      privacyError.style.display = 'block';
+    // 전체 동의 체크 확인
+    if (!agreeAll.checked) {
+      agreeError.style.display = 'block';
       preventSubmit = true;
     } else {
-      privacyError.style.display = 'none';
+      agreeError.style.display = 'none';
     }
 
+    // 아이디 중복 체크
     if (userIdInput.value.trim() && isIdTaken) {
       userIdError.style.display = 'block';
       preventSubmit = true;
     }
 
-    if (password.value !== passwordConfirm.value) {
-      passwordError.style.display = 'block';
+    // 비밀번호 체크
+    if (!checkPasswordFormat() || !checkPasswordMatch()) {
       preventSubmit = true;
     }
 
-    if (!preventSubmit) {
-      form.submit();
-    }
+    if (preventSubmit) event.preventDefault();
   });
 });
