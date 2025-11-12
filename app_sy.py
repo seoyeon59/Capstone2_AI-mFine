@@ -1,7 +1,7 @@
 from flask import Flask, Response, render_template, request, redirect, session, jsonify
 import cv2
 import mediapipe as mp
-import sqlite3
+# import sqlite3
 import pymysql
 import numpy as np
 import threading
@@ -13,7 +13,8 @@ from pykalman import KalmanFilter
 from playsound import playsound
 import yt_dlp
 import os
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote_plus
+from sqlalchemy import create_engine
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)  # 랜덤값으로 만들기(배포시 수정해야함)
@@ -25,6 +26,14 @@ model = joblib.load("pkl/decision_tree_model.pkl")
 # DB 연결
 DB_PATH = 'capstone2.db'
 
+# SQLAlchemy 엔진 생성
+password = "bear0205!@!@"  # 실제 비밀번호
+password_encoded = quote_plus(password)  # URL-safe 인코딩
+
+engine = create_engine(
+    f"mysql+pymysql://root:{password_encoded}@127.0.0.1:3306/capstone2?charset=utf8mb4"
+)
+
 # ----- DB 연결 ------
 """
 def get_db_connection():
@@ -33,22 +42,16 @@ def get_db_connection():
     return conn
 """
 # ASW RDB(MySQL) 버전
-# RDS 연결 정보
-RDS_HOST = "127.0.0.1"
-RDS_PORT = 3306
-RDS_USER = "root"
-RDS_PASSWORD = "bear0205!@!@".encode('utf-8').decode('unicode_escape')
-RDS_DB = "capstone2"
-
 def get_db_connection():
     conn = pymysql.connect(
-        host=RDS_HOST,
-        port=RDS_PORT,
-        user=RDS_USER,
-        password=RDS_PASSWORD,
-        database=RDS_DB,
+        host="127.0.0.1",
+        port=3306,
+        user="root",
+        password="bear0205!@!@",
+        database="capstone2",
         cursorclass=pymysql.cursors.DictCursor  # dict 형태로 결과 사용 가능
     )
+
     return conn
 
 
@@ -374,7 +377,6 @@ def get_camera_url(user_id):
         if conn:
             conn.close()
 
-
 # ------- IP/유튜브 구분 -------
 def get_video_capture(url):
     if "youtube.com" in url or "youtu.be" in url:
@@ -439,7 +441,7 @@ def connect_camera_loop():
                     print("[WARN] camera_url 없음, 3초 후 재시도")
         time.sleep(3)
 """
-# ASW 버전 
+# ASW 버전
 def connect_camera_loop():
     global cap, fps, current_user_id
     while True:
@@ -685,39 +687,33 @@ def register():
         mail = request.form['mail']
         camera_url = request.form['camera_url']  # cameras.camera_url
 
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
+        conn = get_db_connection()
+        cursor = conn.cursor()
 
-            # 서버 측 아이디 중복 체크
-            cursor.execute("SELECT id FROM users WHERE id = %s", (id,))
-            if cursor.fetchone():  # 이미 존재하면
-                return render_template('register.html', error_msg="이미 존재하는 아이디입니다.")
+        # 서버 측 아이디 중복 체크
+        cursor.execute("SELECT id FROM users WHERE id = %s", (id,))
+        if cursor.fetchone():  # 이미 존재하면
+            return render_template('register.html', error_msg="이미 존재하는 아이디입니다.")
 
-            # users 테이블에 삽입
-            cursor.execute("""
-                INSERT INTO users (id, password, username, phone_number, non_guardian_name, mail)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (id, password, username, phone_number, non_guardian_name, mail))
+        # users 테이블에 삽입
+        cursor.execute("""
+            INSERT INTO users (id, password, username, phone_number, non_guardian_name, mail)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (id, password, username, phone_number, non_guardian_name, mail))
 
-            # cameras 테이블에 삽입
-            cursor.execute("""
-                INSERT INTO cameras (user_id, camera_url)
-                VALUES (%s, %s)
-            """, (id, camera_url))
+        # cameras 테이블에 삽입
+        cursor.execute("""
+            INSERT INTO cameras (user_id, camera_url)
+            VALUES (%s, %s)
+        """, (id, camera_url))
 
-            conn.commit()
-            print(f"[INFO] 사용자 {id} 등록 완료")
-            return redirect('/')
-
-        except Exception as e:
-            print(f"❌ 등록 중 오류: {e}")
-            return render_template('register.html', error_msg="등록 중 오류가 발생했습니다.")
-
-        finally:
-            conn.close()
+        conn.commit()
+        conn.close()
+        return redirect('/')
 
     return render_template('register.html')
+
+
 
 
 # ------ 아이디어 중복 체크 확인 -------
@@ -827,17 +823,21 @@ def get_score():
 # ASW 버전
 @app.route('/get_score')
 def get_score():
-    conn = get_db_connection()
-    df = pd.read_sql_query(
-        "SELECT risk_score FROM realtime_screen ORDER BY timestamp DESC LIMIT 1",
-        conn
-    )
-    conn.close()
+    try:
+        # SQLAlchemy 엔진으로 직접 읽기
+        df = pd.read_sql_query(
+            "SELECT risk_score FROM realtime_screen ORDER BY timestamp DESC LIMIT 1",
+            con=engine
+        )
 
-    if df.empty:
-        return jsonify({"risk_score": 0.0})  # 데이터 없으면 0 반환
+        if df.empty:
+            return jsonify({"risk_score": 0.0})  # 데이터 없으면 0 반환
 
-    return jsonify({"risk_score": round(df['risk_score'].iloc[0], 2)})
+        return jsonify({"risk_score": round(df['risk_score'].iloc[0], 2)})
+
+    except Exception as e:
+        print(f"❌ get_score 조회 오류: {e}")
+        return jsonify({"risk_score": 0.0})
 
     # 추후에 주의/경고 알림 보내는 코드 추가 예정
     # 경고음 및 주의임 초기 알람 후 간격 시간
