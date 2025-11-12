@@ -1,0 +1,16 @@
+flask
+cv2
+mediapipe
+pymysql
+numpy
+threading
+time
+datetime
+pandas
+joblib
+pykalman
+playsound
+yt_dlp
+os
+urllib
+sqlalchemy
