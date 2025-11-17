@@ -7,7 +7,6 @@ from sklearn.tree import DecisionTreeClassifier # DT 모델
 from sklearn.metrics import accuracy_score
 import joblib # 모델 저장용
 
-
 # DB 연결
 db_path = "capstone2.db"
 conn = sqlite3.connect(db_path)

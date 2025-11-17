@@ -14,3 +14,4 @@ yt_dlp
 os
 urllib
 sqlalchemy
+boto3

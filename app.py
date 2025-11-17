@@ -5,46 +5,116 @@ import pymysql
 import numpy as np
 import threading
 import time
-from datetime import datetime
+import os
+import io
 import pandas as pd
 import joblib
+import boto3
 from pykalman import KalmanFilter
 from playsound import playsound
-import yt_dlp
-import os
+from yt_dlp import YoutubeDL
 from urllib.parse import urlparse, parse_qs, quote_plus
 from sqlalchemy import create_engine
+from datetime import datetime
 
+# ==========================
+# 1. 환경 설정 및 변수
+# ==========================
 app = Flask(__name__)
 app.secret_key = os.urandom(24)  # 랜덤값으로 만들기(배포시 수정해야함)
 
-# AI 모델 로드
-scaler = joblib.load("pkl/scaler.pkl")
-model = joblib.load("pkl/decision_tree_model.pkl")
+# RDS 연결 정보 (환경 변수를 통해 안전하게 로드)
+# EC2에 환경 변수 설정 필요: export DB_HOST='[RDS 엔드포인트]'
+DB_HOST = os.environ.get('DB_HOST')  # RDS 엔드포인트
+DB_USER = os.environ.get('DB_USER', 'admin')  # RDS 마스터 사용자 이름
+DB_PASSWORD = os.environ.get('DB_PASSWORD')  # RDS 마스터 암호
+DB_NAME = 'capstone2'
+DB_PORT = 3306
 
-# DB 연결
-DB_PATH = 'capstone2.db'
+if not all([DB_HOST, DB_PASSWORD]):
+    # 배포 환경에서 이 오류가 나면 환경 변수 설정이 안 된 것임
+    print("FATAL ERROR: DB_HOST or DB_PASSWORD environment variables not set.")
 
-# SQLAlchemy 엔진 생성
-password = "bear0205!@!@"  # 실제 비밀번호
-password_encoded = quote_plus(password)  # URL-safe 인코딩
+# ==========================
+# 2. AI 모델 로드 (S3에서)
+# ==========================
+# S3 클라이언트 초기화 (EC2 IAM Role을 통해 자동 인증됨)
+s3 = boto3.client('s3')
+BUCKET_NAME = 'swu-sw-02-s3'  # 사용자님의 S3 버킷 이름
 
-engine = create_engine(
-    f"mysql+pymysql://root:{password_encoded}@127.0.0.1:3306/capstone2?charset=utf8mb4"
-)
 
-# ----- DB 연결 ------
-def get_db_connection():
-    conn = pymysql.connect(
-        host="127.0.0.1",
-        port=3306,
-        user="root",
-        password="bear0205!@!@",
-        database="capstone2",
-        cursorclass=pymysql.cursors.DictCursor  # dict 형태로 결과 사용 가능
+def load_model_from_s3(key_name):
+    """S3에서 파일을 로드하여 joblib으로 디시리얼라이즈합니다."""
+    # S3에서 파일을 객체로 가져옴 (BUCKET_NAME 변수 사용으로 개선)
+    response = s3.get_object(Bucket=BUCKET_NAME, Key=key_name)
+    # 객체의 Body(내용)를 읽어 메모리(BytesIO)에 저장
+    model_data = io.BytesIO(response['Body'].read())
+    # joblib을 사용하여 메모리에서 모델을 로드
+    return joblib.load(model_data)
+
+
+try:
+    # S3에서 모델 파일 로드
+    scaler = load_model_from_s3("scaler.pkl")
+    model = load_model_from_s3("decision_tree_model.pkl")
+    print("✅ AI Models loaded successfully from S3.")
+except Exception as e:
+    print(f"❌ ERROR: Failed to load models from S3. Check file names and S3 permissions. Error: {e}")
+
+
+    # 모델 로드 실패 시 앱 실행 중단 방지를 위해 더미 객체 할당
+    class DummyScaler:
+        def transform(self, X): return X
+
+        feature_names_in_ = []
+
+
+    class DummyModel:
+        def predict_proba(self, X): return np.array([[1.0, 0.0]])
+
+        def predict(self, X): return np.array([0])
+
+
+    scaler = DummyScaler()
+    model = DummyModel()
+
+# ==========================
+# 3. DB 연결 및 엔진 설정 (RDS 엔드포인트 사용)
+# ==========================
+
+# SQLAlchemy 엔진 생성 (비밀번호를 URL-safe 인코딩하여 RDS 엔드포인트 사용)
+password_encoded = quote_plus(DB_PASSWORD)
+try:
+    engine = create_engine(
+        f"mysql+pymysql://{DB_USER}:{password_encoded}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4",
+        pool_recycle=3600  # 1시간마다 연결 재활용 (DB 연결 끊김 방지)
     )
+    print("✅ SQLAlchemy Engine configured with RDS endpoint.")
+except Exception as e:
+    print(f"❌ SQLAlchemy Engine configuration failed: {e}")
+    engine = None
 
-    return conn
+
+# DB 연결 함수 (pymysql을 사용하여 RDS 엔드포인트 사용)
+def get_db_connection():
+    try:
+        conn = pymysql.connect(
+            host=DB_HOST,  # RDS 엔드포인트
+            port=DB_PORT,
+            user=DB_USER,  # RDS 마스터 사용자
+            password=DB_PASSWORD,  # 환경 변수에서 로드된 비밀번호
+            database=DB_NAME,
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        return conn
+    except Exception as e:
+        print(f"❌ DB Connection Error (check RDS host/security group): {e}")
+        return None
+
+
+# ==========================
+# 4. MediaPipe 및 기타 로직 (변경 없음)
+# ==========================
 
 # MediaPipe Pose 초기화
 mp_pose = mp.solutions.pose
@@ -64,7 +134,7 @@ current_user_id = None
 
 # 카메라 연결 관련 전역 변수
 cap = None  # 전역 카메라 객체
-fps = 30 # 기본 FPS
+fps = 30  # 기본 FPS
 
 # 계산 처리용 전역 변수
 prev_angles = {}  # 각도 저장
@@ -94,6 +164,7 @@ joint_triplets = [
     ('torso_right', 0, 12, 24),
     ('spine', 0, 23, 24),
 ]
+
 
 # ----- 중심 이동/속도/각속도 계산 -----
 def compute_center_dynamics(df, fps=30, left_pelvis='kp23', right_pelvis='kp24'):
@@ -141,6 +212,7 @@ def compute_center_dynamics(df, fps=30, left_pelvis='kp23', right_pelvis='kp24')
 
     return pd.DataFrame(centers)
 
+
 # ----- 노이즈 제거 : Kalman ------
 def smooth_with_kalman(df, keypoints):
     df_smooth = df.copy()
@@ -157,6 +229,7 @@ def smooth_with_kalman(df, keypoints):
             state_means, _ = kf.filter(c)
             df_smooth[col] = state_means[:, 0]
     return df_smooth
+
 
 # ----- 중심 정렬 ------
 def centralize_kp(df, pelvis_idx=(23, 24)):
@@ -177,13 +250,14 @@ def centralize_kp(df, pelvis_idx=(23, 24)):
 
     return df_central
 
+
 # ----- 스케일 정규화 -----
 def scale_normalize_kp(df, ref_joints=(23, 24)):
     df_scaled = df.copy()
     left_x, left_y, left_z = df[f'kp{ref_joints[0]}_x'], df[f'kp{ref_joints[0]}_y'], df[f'kp{ref_joints[0]}_z']
     right_x, right_y, right_z = df[f'kp{ref_joints[1]}_x'], df[f'kp{ref_joints[1]}_y'], df[f'kp{ref_joints[1]}_z']
 
-    scale = np.sqrt((left_x - right_x)**2 + (left_y - right_y)**2 + (left_z - right_z)**2)
+    scale = np.sqrt((left_x - right_x) ** 2 + (left_y - right_y) ** 2 + (left_z - right_z) ** 2)
     scale[scale == 0] = 1
 
     for col in df.columns:
@@ -191,6 +265,7 @@ def scale_normalize_kp(df, ref_joints=(23, 24)):
             df_scaled[col] = df[col] / scale
 
     return df_scaled
+
 
 # ----- 각도 계산 -----
 def compute_angle(a, b, c):
@@ -200,6 +275,7 @@ def compute_angle(a, b, c):
     cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-8)
     angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
     return np.degrees(angle)
+
 
 # ----- 관절 각도/각속도/각가속도 계산 -----
 def calculate_angles(row, fps=30):
@@ -238,63 +314,76 @@ def calculate_angles(row, fps=30):
 
     return result
 
+
 # ----- DB 저장 함수(실시간 + 10분 후 삭제) -----
 def save_to_db(data_dict):
+    conn = None
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
                 # 현재 시각 추가
                 data_dict['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                # center_x/y/z 제거 (DB 컬럼에 없음)
-                filtered_data = {
-                    k: v for k, v in data_dict.items()
-                    if k not in ['center_x', 'center_y', 'center_z']
-                }
+        with conn.cursor() as cursor:
+            # 현재 시각 추가
+            data_dict['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                # INSERT 실행 (MySQL에서는 ? → %s)
-                columns = ', '.join(filtered_data.keys())
-                placeholders = ', '.join(['%s'] * len(filtered_data))
-                sql = f"INSERT INTO realtime_screen ({columns}) VALUES ({placeholders})"
-                cursor.execute(sql, tuple(filtered_data.values()))
+            # center_x/y/z 제거 (DB 컬럼에 없음)
+            filtered_data = {
+                k: v for k, v in data_dict.items()
+                if k not in ['center_x', 'center_y', 'center_z']
+            }
 
-                # user_id별 최대 600개 제한
-                user_id = filtered_data.get('user_id')
-                if user_id:
-                    cursor.execute("SELECT COUNT(*) AS cnt FROM realtime_screen WHERE user_id = %s", (user_id,))
-                    count = cursor.fetchone()['cnt']
+            # INSERT 실행 (MySQL에서는 ? → %s)
+            columns = ', '.join(filtered_data.keys())
+            placeholders = ', '.join(['%s'] * len(filtered_data))
+            sql = f"INSERT INTO realtime_screen ({columns}) VALUES ({placeholders})"
+            cursor.execute(sql, tuple(filtered_data.values()))
 
-                    if count > 600:
-                        cursor.execute("""
-                            DELETE FROM realtime_screen
-                            WHERE user_id = %s
-                            AND timestamp NOT IN (
-                                SELECT t.timestamp FROM (
-                                    SELECT timestamp
-                                    FROM realtime_screen
-                                    WHERE user_id = %s
-                                    ORDER BY timestamp DESC
-                                    LIMIT 600
-                                ) AS t
-                            )
-                        """, (user_id, user_id))
+            # user_id별 최대 600개 제한 (DB 자원 보호)
+            user_id = filtered_data.get('user_id')
+            if user_id:
+                cursor.execute("SELECT COUNT(*) AS cnt FROM realtime_screen WHERE user_id = %s", (user_id,))
+                count = cursor.fetchone()['cnt']
 
-                conn.commit()
-                print(f"✅ {user_id} 데이터 DB 저장 완료 ({len(filtered_data)}개 컬럼)")
+                if count > 600:
+                    cursor.execute("""
+                        DELETE FROM realtime_screen
+                        WHERE user_id = %s
+                        AND timestamp NOT IN (
+                            SELECT t.timestamp FROM (
+                                SELECT timestamp
+                                FROM realtime_screen
+                                WHERE user_id = %s
+                                ORDER BY timestamp DESC
+                                LIMIT 600
+                            ) AS t
+                        )
+                    """, (user_id, user_id))
+
+            conn.commit()
+            print(f"✅ {user_id} 데이터 DB 저장 완료 ({len(filtered_data)}개 컬럼)")
 
     except Exception as e:
         print("❌ DB 저장 중 오류:", e)
+    finally:
+        if conn:
+            conn.close()
+
 
 # ------- DB에서 camera_url 가져오기 : 수정 제안 -------
 def get_camera_url(user_id):
     conn = None
     try:
         conn = get_db_connection()
+        if conn is None:
+            return None
+
         cursor = conn.cursor()
         cursor.execute("SELECT camera_url FROM cameras WHERE user_id = %s", (user_id,))
         row = cursor.fetchone()
         if row and 'camera_url' in row:
-            return row['camera_url']  # <-- 이렇게 수정
+            return row['camera_url']
         return None
     except Exception as e:
         print(f"⚠️ 카메라 URL 조회 오류: {e}")
@@ -302,6 +391,7 @@ def get_camera_url(user_id):
     finally:
         if conn:
             conn.close()
+
 
 # ------- IP/유튜브 구분 및 카메라 연결 : 수정 제안-------
 def get_video_capture(url):
@@ -314,7 +404,8 @@ def get_video_capture(url):
                 'no_warnings': True,
                 'nocheckcertificate': True
             }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # yt_dlp 모듈 사용을 위한 변경
+            with YoutubeDL(ydl_opts) as ydl:
                 info_dict = ydl.extract_info(url, download=False)
                 video_url = info_dict.get("url")
                 if not video_url:
@@ -329,6 +420,7 @@ def get_video_capture(url):
     except Exception as e:
         print(f"[ERROR] 비디오 캡처 생성 실패: {e}")
         return None
+
 
 # ------ IP 웹캠 연결 반복 시도 : 수정 제안 -------
 def connect_camera_loop():
@@ -375,6 +467,7 @@ def connect_camera_loop():
             print(f"[ERROR] connect_camera_loop 예외 발생: {e}")
             time.sleep(1)
 
+
 # ------ 프레임 읽기 스레드 ------
 def capture_frames():
     global latest_frame, cap, frame_idx, fps, latest_score, latest_label
@@ -384,13 +477,15 @@ def capture_frames():
 
     while True:
         if cap is None or not cap.isOpened():
+            # 빈 프레임 생성 후 대기
             frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            with frame_lock:
+                latest_frame = frame.copy()
             time.sleep(0.2)
             continue
 
         try:
             # ✅ 안정형: grab을 과도하게 하지 않음
-            # (YouTube는 grab() 반복 시 연결이 끊김)
             ret, frame = cap.read()
 
             if not ret or frame is None:
@@ -434,14 +529,17 @@ def capture_frames():
 
                 try:
                     feature_cols = [col for col in calculated.keys() if (
-                        "angle" in col.lower() or
-                        "angular_velocity" in col.lower() or
-                        "angular_acceleration" in col.lower() or
-                        "center" in col.lower()
+                            "angle" in col.lower() or
+                            "angular_velocity" in col.lower() or
+                            "angular_acceleration" in col.lower() or
+                            "center" in col.lower()
                     )]
 
                     X = pd.DataFrame([[calculated[col] for col in feature_cols]], columns=feature_cols).fillna(0.0)
-                    X = X.reindex(columns=scaler.feature_names_in_, fill_value=0.0)
+                    # S3 모델 로드 실패 시 더미 스케일러/모델을 사용하므로,
+                    # 실제 로드 성공 시에만 reindex를 적용함.
+                    if hasattr(scaler, 'feature_names_in_'):
+                        X = X.reindex(columns=scaler.feature_names_in_, fill_value=0.0)
 
                     X_scaled = scaler.transform(X)
                     pred = model.predict_proba(X_scaled)
@@ -460,8 +558,19 @@ def capture_frames():
                     calculated["risk_score"] = 0.0
                     calculated["Label"] = 0
 
+                calculated['user_id'] = current_user_id  # DB 저장을 위해 user_id 추가
                 # DB 저장
                 save_to_db(calculated)
+
+                # MediaPipe 랜드마크를 프레임에 그림
+                mp_drawing = mp.solutions.drawing_utils
+                mp_drawing.draw_landmarks(
+                    frame,
+                    results.pose_landmarks,
+                    mp_pose.POSE_CONNECTIONS,
+                    mp_drawing.DrawingSpec(color=(255, 0, 0), thickness=2, circle_radius=2),  # 관절 색상 (파랑)
+                    mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2)  # 선 색상 (초록)
+                )
 
             # 최신 프레임 저장 (lock으로 보호)
             with frame_lock:
@@ -472,12 +581,13 @@ def capture_frames():
             print(f"[ERROR] capture_frames 예외 발생: {e}")
             time.sleep(0.2)
 
-        # FPS 제어: 너무 빠르면 CPU 과다, 너무 느리면 딜레이
+        # FPS 제어
         time.sleep(1 / fps if fps > 0 else 1 / 25)
 
 
 # ------ Flask MJPEG 스트리밍 : 수정 제안 --------
 empty_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
 def gen_frames():
     global latest_frame
     while True:
@@ -489,11 +599,11 @@ def gen_frames():
                 if frame is latest_frame:
                     frame = frame.copy()
 
-            ret, buffer = cv2.imencode('.jpg', frame)
-            if not ret:
-                print("[WARN] JPEG 인코딩 실패")
-                time.sleep(0.05)
-                continue
+                ret, buffer = cv2.imencode('.jpg', frame)
+                if not ret:
+                    print("[WARN] JPEG 인코딩 실패")
+                    time.sleep(0.05)
+                    continue
 
             frame_bytes = buffer.tobytes()
             yield (b'--frame\r\n'
@@ -506,6 +616,7 @@ def gen_frames():
             print(f"[ERROR] gen_frames 예외 발생: {e}")
             time.sleep(0.005)
 
+
 # ==========================
 # Flask 라우팅
 # ==========================
@@ -513,6 +624,7 @@ def gen_frames():
 @app.route('/')
 def home():
     return render_template('login.html')
+
 
 # ------ 로그인 기능 -------
 @app.route('/login', methods=['POST'])
@@ -522,6 +634,9 @@ def login():
     password = request.form['password']
 
     conn = get_db_connection()
+    if conn is None:
+        return render_template('login.html', error_msg="DB 연결 실패. 관리자에게 문의하세요.")
+
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE id=%s AND password=%s", (user_id, password))
     user = cursor.fetchone()
@@ -534,6 +649,7 @@ def login():
     else:
         # 로그인 실패 시 로그인 페이지 다시 렌더링 + 에러 메시지 전달
         return render_template('login.html', error_msg="아이디 또는 비밀번호를 확인하세요.")
+
 
 # ----- 회원가입 기능 ------
 @app.route('/register', methods=['GET', 'POST'])
@@ -548,11 +664,15 @@ def register():
         camera_url = request.form['camera_url']  # cameras.camera_url
 
         conn = get_db_connection()
+        if conn is None:
+            return render_template('register.html', error_msg="DB 연결 실패. 관리자에게 문의하세요.")
+
         cursor = conn.cursor()
 
         # 서버 측 아이디 중복 체크
         cursor.execute("SELECT id FROM users WHERE id = %s", (id,))
         if cursor.fetchone():  # 이미 존재하면
+            conn.close()
             return render_template('register.html', error_msg="이미 존재하는 아이디입니다.")
 
         # users 테이블에 삽입
@@ -573,6 +693,7 @@ def register():
 
     return render_template('register.html')
 
+
 # ------ 아이디어 중복 체크 확인 -------
 @app.route('/check_id')
 def check_id():
@@ -581,6 +702,9 @@ def check_id():
 
     if user_id:
         conn = get_db_connection()
+        if conn is None:
+            return jsonify({"exists": False, "error": "DB_CONNECTION_FAILED"})
+
         cursor = conn.cursor()
         cursor.execute("SELECT id FROM users WHERE id = %s", (user_id,))
         if cursor.fetchone():
@@ -588,6 +712,7 @@ def check_id():
         conn.close()
 
     return jsonify({"exists": exists})
+
 
 # ----- 실시간 화면 및 신고하는 페이지 ------
 @app.route('/camera')
@@ -610,11 +735,14 @@ def index():
                     query = parse_qs(urlparse(camera_url).query)
                     video_id = query.get("v", [None])[0]
                 elif "youtu.be" in camera_url:
-                    video_id = camera_url.split("/")[-1]
+                    # 'youtu.be/video_id' 형태 처리
+                    video_id = camera_url.split("/")[-1].split("?")[0]
                 elif "youtube.com/shorts" in camera_url:
-                    video_id = camera_url.split("/")[-1]
+                    # 'shorts/video_id' 형태 처리
+                    video_id = camera_url.split("/")[-1].split("?")[0]
 
                 if video_id:
+                    # &autoplay=1 추가: 영상 자동 재생
                     embed_url = f"https://www.youtube.com/embed/{video_id}?autoplay=1"
                 else:
                     # 영상 ID 못 찾으면 유튜브 처리 취소
@@ -622,9 +750,11 @@ def index():
                     embed_url = None
 
     return render_template('camera.html',
+                           user_id=user_id,  # 사용자 ID 전달
                            camera_url=camera_url,
                            is_youtube=is_youtube,
                            embed_url=embed_url)
+
 
 # ----- 실시간 화면 ------
 @app.route('/video_feed')
@@ -632,23 +762,31 @@ def video_feed():
     return Response(gen_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
+
 # ----- 낙상 위험 점수 기반 알림 로직 추가 ------
 def play_alarm_sound():
     """🔊 서버 스피커에서 경고음 재생"""
+
     def _play():
         try:
+            # playsound 모듈은 EC2 서버 환경에서 소리가 나지 않을 수 있음
             playsound("static/alarmclockbeepsaif.mp3")
             print("🔊 Alarm sound played!")
         except Exception as e:
             print(f"❌ Alarm Sound Error: {e}")
+
     # 알림 발생시 Flask가 멈춤을 대비 -> 별로 스레드 생성
     threading.Thread(target=_play, daemon=True).start()
+
 
 # ----- 새로운 위험도 확인 라우트 ------
 @app.route('/get_score')
 def get_score():
     try:
-        # SQLAlchemy 엔진으로 직접 읽기
+        # SQLAlchemy 엔진을 통해 DB에서 직접 읽기
+        if engine is None:
+            return jsonify({"risk_score": 0.0, "error": "DB_ENGINE_FAILED"})
+
         df = pd.read_sql_query(
             "SELECT risk_score FROM realtime_screen ORDER BY timestamp DESC LIMIT 1",
             con=engine
@@ -663,17 +801,22 @@ def get_score():
         print(f"❌ get_score 조회 오류: {e}")
         return jsonify({"risk_score": 0.0})
 
-    # 추후에 주의/경고 알림 보내는 코드 추가 예정
-    # 경고음 및 주의임 초기 알람 후 간격 시간
-    # 주의 : 최조 주의 알람에서 10분 기준으로 알림 다시 발송
-    # 경고 : 최조 경고 알람 (1번)
 
 # ==========================
 # 서버 실행 및 스레드 실행
 # ==========================
 if __name__ == "__main__":
+    # MediaPipe Drawing Utility import (capture_frames 함수에서 사용됨)
+    mp_drawing = mp.solutions.drawing_utils
+
+    # ⚠️ 빈 프레임을 미리 초기화하여 MJPEG 스트리밍 오류 방지
+    with frame_lock:
+        latest_frame = empty_frame.copy()
+
+    # 카메라 연결 스레드 시작
     threading.Thread(target=connect_camera_loop, daemon=True).start()
+    # 프레임 캡처/분석/DB 저장 스레드 시작
     threading.Thread(target=capture_frames, daemon=True).start()
+
+    # 배포시 변경 사항 (debug=False, use_reloader=False)
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-    # 배표시 변경 사항
-    # app.run(host='0.0.0.0', port=5000, threaded=True, use_reloader=False, threaded=True)
