@@ -25,10 +25,10 @@ app.secret_key = os.urandom(24)  # 랜덤값으로 만들기(배포시 수정해
 
 # RDS 연결 정보 (환경 변수를 통해 안전하게 로드)
 # EC2에 환경 변수 설정 필요: export DB_HOST='[RDS 엔드포인트]'
-DB_HOST = os.environ.get('DB_HOST')  # RDS 엔드포인트
+DB_HOST = os.environ.get('swu-sw-02-db.cfoqwsiqgd5l.ap-northeast-2.rds.amazonaws.com')  # RDS 엔드포인트
 DB_USER = os.environ.get('DB_USER', 'admin')  # RDS 마스터 사용자 이름
-DB_PASSWORD = os.environ.get('DB_PASSWORD')  # RDS 마스터 암호
-DB_NAME = 'capstone2'
+DB_PASSWORD = os.environ.get('aimfine2!')  # RDS 마스터 암호
+DB_NAME = 'swu-sw-02-db'
 DB_PORT = 3306
 
 if not all([DB_HOST, DB_PASSWORD]):
