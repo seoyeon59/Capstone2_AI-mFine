@@ -1,3 +1,4 @@
+import yt_dlp
 from flask import Flask, Response, render_template, request, redirect, session, jsonify
 import cv2
 import mediapipe as mp
@@ -12,7 +13,6 @@ import joblib
 import boto3
 from pykalman import KalmanFilter
 from playsound import playsound
-from yt_dlp import YoutubeDL
 from urllib.parse import urlparse, parse_qs, quote_plus
 from sqlalchemy import create_engine
 from datetime import datetime
@@ -393,26 +393,34 @@ def get_camera_url(user_id):
             conn.close()
 
 
-# ------- IP/유튜브 구분 및 카메라 연결 : 수정 제안-------
+# ------- IP/유튜브 구분 및 카메라 연결 -------
+def get_youtube_direct_url(youtube_url):
+    """
+    YouTube URL을 OpenCV가 읽을 수 있는 direct stream URL로 변환
+    """
+    ydl_opts = {
+        "format": "best",
+        "quiet": True,
+        "noplaylist": True,
+        "live_from_start": False
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(youtube_url, download=False)
+        return info['url']  # OpenCV VideoCapture에 넣을 수 있는 URL
+
 def get_video_capture(url):
     try:
         if "youtube.com" in url or "youtu.be" in url:
-            print("[INFO] YouTube 영상 URL 추출 중...")
-            ydl_opts = {
-                'format': 'best[ext=mp4]/best',
-                'quiet': True,
-                'no_warnings': True,
-                'nocheckcertificate': True
-            }
-            # yt_dlp 모듈 사용을 위한 변경
-            with YoutubeDL(ydl_opts) as ydl:
-                info_dict = ydl.extract_info(url, download=False)
-                video_url = info_dict.get("url")
-                if not video_url:
-                    print("[ERROR] YouTube URL 가져오기 실패")
-                    return None
-                cap = cv2.VideoCapture(video_url)
+            print("[INFO] YouTube 영상 direct URL 추출 중...")
+            try:
+                direct_url = get_youtube_direct_url(url)
+                print("[INFO] YouTube direct stream URL:", direct_url)
+                cap = cv2.VideoCapture(direct_url)
                 return cap
+            except Exception as e:
+                print("[ERROR] YouTube direct stream load error:", e)
+                return None
         else:
             print("[INFO] IP 카메라 연결 중...")
             cap = cv2.VideoCapture(url)
@@ -420,7 +428,6 @@ def get_video_capture(url):
     except Exception as e:
         print(f"[ERROR] 비디오 캡처 생성 실패: {e}")
         return None
-
 
 # ------ IP 웹캠 연결 반복 시도 : 수정 제안 -------
 def connect_camera_loop():

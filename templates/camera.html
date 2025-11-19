@@ -13,23 +13,22 @@
     <div class="main-content">
       <!-- 왼쪽: 실시간 영상 또는 유튜브 -->
       <div class="video-section">
-        <img id="cameraFeed" src="{{ url_for('video_feed') }}" alt="Camera Feed">
-<!--        {% if camera_url %}-->
-<!--            {% if is_youtube %}-->
-<!--                &lt;!&ndash; 유튜브 영상 &ndash;&gt;-->
-<!--                <iframe width="640" height="360"-->
-<!--                        src="{{ embed_url }}"-->
-<!--                        frameborder="0"-->
-<!--                        allow="autoplay; encrypted-media"-->
-<!--                        allowfullscreen>-->
-<!--                </iframe>-->
-<!--            {% else %}-->
-<!--                &lt;!&ndash; IP 웹캠 &ndash;&gt;-->
-<!--                <img id="cameraFeed" src="{{ url_for('video_feed') }}" alt="Camera Feed">-->
-<!--            {% endif %}-->
-<!--        {% else %}-->
-<!--            <p>카메라 또는 영상 URL이 설정되지 않았습니다.</p>-->
-<!--        {% endif %}-->
+        {% if camera_url %}
+            {% if is_youtube %}
+                <!-- 유튜브 영상 -->
+                <iframe width="640" height="360"
+                        src="{{ embed_url }}"
+                        frameborder="0"
+                        allow="autoplay; encrypted-media"
+                        allowfullscreen>
+                </iframe>
+            {% else %}
+                <!-- IP 웹캠 MJPEG 스트림 -->
+                <img id="cameraFeed" src="{{ url_for('video_feed') }}" alt="Camera Feed">
+            {% endif %}
+        {% else %}
+            <p>카메라 또는 영상 URL이 설정되지 않았습니다.</p>
+        {% endif %}
       </div>
 
       <!-- 오른쪽: 위험 점수 -->
