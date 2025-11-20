@@ -12,7 +12,7 @@ import pandas as pd
 import joblib
 import boto3
 from pykalman import KalmanFilter
-from playsound import playsound
+# from playsound import playsound
 from urllib.parse import urlparse, parse_qs, quote_plus
 from sqlalchemy import create_engine
 from datetime import datetime
@@ -371,7 +371,7 @@ def save_to_db(data_dict):
             conn.close()
 
 
-# ------- DB에서 camera_url 가져오기 : 수정 제안 -------
+# ------- DB에서 camera_url 가져오기 -------
 def get_camera_url(user_id):
     conn = None
     try:
@@ -405,53 +405,74 @@ ydl_opts = {
 
 def get_youtube_direct_url(youtube_url):
     """yt-dlp를 사용하여 YouTube 영상의 직접 스트리밍 URL을 추출합니다."""
-    # yt-dlp는 일반적으로 로컬에 저장하지 않고 스트림 정보만 가져옴
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(youtube_url, download=False)
-        # OpenCV VideoCapture에 넣을 수 있는 URL (스트리밍 URL) 반환
-        return info['url']
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # download=False로 설정하여 정보만 추출
+            info = ydl.extract_info(youtube_url, download=False)
+            # OpenCV VideoCapture에 넣을 수 있는 URL (스트리밍 URL) 반환
+            return info['url']
+    except Exception as e:
+        # 추출 실패 시 오류 메시지 출력 후 None 반환
+        print(f"[ERROR] yt-dlp direct URL extraction failed: {e}")
+        return None
 
 
 def get_video_capture(url):
     """주어진 URL 또는 ID를 기반으로 cv2.VideoCapture 객체를 반환합니다."""
-    try:
-        # 1. URL이 정수(로컬 웹캠)인 경우 분리 처리
-        if isinstance(url, int):
-            print("[INFO] 로컬 웹캠 연결 시도 중...")
-            cap = cv2.VideoCapture(url)  # cv2.VideoCapture(0) 실행
-            # 로컬 웹캠은 초기화에 시간이 걸릴 수 있음
-            if cap.isOpened():
-                return cap
-            else:
-                return None
-
-        # 2. URL이 문자열이고 유튜브인 경우
-        if isinstance(isinstance(url, str) and ("youtube.com" in url or "youtu.be" in url)):
-            print("[INFO] YouTube 영상 direct URL 추출 중...")
-            try:
-                direct_url = get_youtube_direct_url(url)
-                print("[INFO] YouTube direct stream URL:", direct_url)
-                # 추출된 direct_url로 VideoCapture 시도
-                cap = cv2.VideoCapture(direct_url)
-                return cap
-            except Exception as e:
-                print(f"[ERROR] YouTube direct stream load error: {e}")
-                return None
-
-        # 3. URL이 문자열이고 IP 카메라인 경우
-        elif isinstance(url, str):
-            print("[INFO] IP 카메라 연결 중...")
-            cap = cv2.VideoCapture(url)
+    # 1. URL이 정수(로컬 웹캠)인 경우 분리 처리
+    if isinstance(url, int):
+        print("[INFO] 로컬 웹캠 연결 시도 중...")
+        cap = cv2.VideoCapture(url)  # cv2.VideoCapture(0) 실행
+        # 로컬 웹캠은 초기화에 시간이 걸릴 수 있음
+        if cap.isOpened():
             return cap
+        else:
+            # 로컬 웹캠은 EC2에서 항상 실패하므로 명확한 오류 로그 출력
+            print("[ERROR] 로컬 웹캠 연결 실패. EC2 환경에서는 웹캠이 존재하지 않습니다.")
+            return None
 
-        return None  # 유효하지 않은 URL 타입
+    # 2. URL이 문자열이고 유튜브인 경우
+    # 🚨 [수정 1] URL 검사 로직 오류 수정 및 디버깅 로그 추가
+    if isinstance(url, str) and ("youtube.com" in url or "youtu.be" in url):
+        print("[INFO] YouTube 영상 direct URL 추출 중...")
+        try:
+            direct_url = get_youtube_direct_url(url)
 
-    except Exception as e:
-        print(f"[ERROR] 비디오 캡처 생성 실패: {e}")
-        return None
+            if not direct_url:
+                print("[ERROR] yt-dlp: direct_url 추출 실패로 VideoCapture 시도 불가.")
+                return None
+
+            # 디버깅을 위해 추출된 URL 출력 (길이가 길 수 있으므로 50자만 출력)
+            print(f"[INFO] YouTube direct stream URL (extracted): {direct_url[:50]}...")
+
+            # 추출된 direct_url로 VideoCapture 시도
+            cap = cv2.VideoCapture(direct_url)
+
+            # 🚨 [수정 2] VideoCapture 성공 여부 즉시 검사
+            if not cap.isOpened():
+                print(f"[ERROR] cv2.VideoCapture({url})로 스트림 열기 실패. 추출 URL: {direct_url[:50]}...")
+                cap.release()
+                return None
+
+            return cap
+        except Exception as e:
+            print(f"[ERROR] YouTube direct stream load error: {e}")
+            return None
+
+    # 3. URL이 문자열이고 IP 카메라인 경우
+    elif isinstance(url, str):
+        print("[INFO] IP 카메라 연결 중...")
+        cap = cv2.VideoCapture(url)
+        # IP 카메라도 연결 성공 여부 검사
+        if not cap.isOpened():
+            print(f"[ERROR] IP 카메라 스트림 ({url}) 열기 실패.")
+            return None
+        return cap
+
+    return None  # 유효하지 않은 URL 타입
 
 
-# ------ IP 웹캠 연결 반복 시도 : 수정 제안 -------
+# ------ IP 웹캠 연결 반복 시도 -------
 def connect_camera_loop():
     global cap, fps, current_user_id
 
@@ -485,9 +506,11 @@ def connect_camera_loop():
                 # 실제 FPS 값을 가져와서 설정 (대부분의 웹캠/IP캠은 30)
                 fps_val = int(cap.get(cv2.CAP_PROP_FPS))
                 fps = fps_val if fps_val > 0 else 30
-                print(f"[INFO] 카메라 연결 성공 (FPS: {fps})")
+                # 🚨 [수정 3] 로그에 어떤 URL로 연결 성공했는지 표시
+                print(f"[INFO] 카메라 연결 성공 (FPS: {fps}) - Source URL: {url}")
             else:
-                print(f"[WARN] 카메라 연결 실패, 3초 후 재시도")
+                # 🚨 [수정 3] 로그에 어떤 URL로 연결 실패했는지 표시
+                print(f"[WARN] 카메라 연결 실패 (URL: {url}), 3초 후 재시도")
                 time.sleep(3)
                 continue
 
@@ -841,22 +864,22 @@ def video_feed():
     return Response(gen_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
-
-# ----- 낙상 위험 점수 기반 알림 로직 추가 ------
-def play_alarm_sound():
-    """🔊 서버 스피커에서 경고음 재생 (EC2 환경에서는 작동하지 않을 가능성이 높음)"""
-
-    def _play():
-        try:
-            # playsound 모듈은 EC2 서버 환경에서 소리가 나지 않을 수 있음
-            # 로컬에서만 테스트용으로 활용
-            playsound("static/alarmclockbeepsaif.mp3")
-            print("🔊 Alarm sound played!")
-        except Exception as e:
-            print(f"❌ Alarm Sound Error: {e}")
-
-    # 알림 발생시 Flask가 멈춤을 대비 -> 별도 스레드 생성
-    threading.Thread(target=_play, daemon=True).start()
+#
+# # ----- 낙상 위험 점수 기반 알림 로직 추가 ------
+# def play_alarm_sound():
+#     """🔊 서버 스피커에서 경고음 재생 (EC2 환경에서는 작동하지 않을 가능성이 높음)"""
+#
+#     def _play():
+#         try:
+#             # playsound 모듈은 EC2 서버 환경에서 소리가 나지 않을 수 있음
+#             # 로컬에서만 테스트용으로 활용
+#             playsound("static/alarmclockbeepsaif.mp3")
+#             print("🔊 Alarm sound played!")
+#         except Exception as e:
+#             print(f"❌ Alarm Sound Error: {e}")
+#
+#     # 알림 발생시 Flask가 멈춤을 대비 -> 별도 스레드 생성
+#     threading.Thread(target=_play, daemon=True).start()
 
 
 # ----- 새로운 위험도 확인 라우트 ------
