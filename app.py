@@ -319,10 +319,9 @@ def calculate_angles(row, fps=30):
 def save_to_db(data_dict):
     conn = None
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                # 현재 시각 추가
-                data_dict['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn = get_db_connection()
+        if conn is None:
+            return  # DB 연결 실패 시 종료
 
         with conn.cursor() as cursor:
             # 현재 시각 추가
@@ -343,6 +342,7 @@ def save_to_db(data_dict):
             # user_id별 최대 600개 제한 (DB 자원 보호)
             user_id = filtered_data.get('user_id')
             if user_id:
+                # Count 쿼리는 커서 재사용 가능 (단일 Connection 내)
                 cursor.execute("SELECT COUNT(*) AS cnt FROM realtime_screen WHERE user_id = %s", (user_id,))
                 count = cursor.fetchone()['cnt']
 
@@ -380,6 +380,7 @@ def get_camera_url(user_id):
             return None
 
         cursor = conn.cursor()
+        # camera 테이블에서 user_id에 해당하는 camera_url 조회
         cursor.execute("SELECT camera_url FROM cameras WHERE user_id = %s", (user_id,))
         row = cursor.fetchone()
         if row and 'camera_url' in row:
@@ -394,40 +395,61 @@ def get_camera_url(user_id):
 
 
 # ------- IP/유튜브 구분 및 카메라 연결 -------
-def get_youtube_direct_url(youtube_url):
-    """
-    YouTube URL을 OpenCV가 읽을 수 있는 direct stream URL로 변환
-    """
-    ydl_opts = {
-        "format": "best",
-        "quiet": True,
-        "noplaylist": True,
-        "live_from_start": False
-    }
+ydl_opts = {
+    "format": "bestvideo[ext=mp4]+bestaudio/best",
+    "quiet": True,
+    "noplaylist": True,
+    "live_from_start": False
+}
 
+
+def get_youtube_direct_url(youtube_url):
+    """yt-dlp를 사용하여 YouTube 영상의 직접 스트리밍 URL을 추출합니다."""
+    # yt-dlp는 일반적으로 로컬에 저장하지 않고 스트림 정보만 가져옴
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(youtube_url, download=False)
-        return info['url']  # OpenCV VideoCapture에 넣을 수 있는 URL
+        # OpenCV VideoCapture에 넣을 수 있는 URL (스트리밍 URL) 반환
+        return info['url']
+
 
 def get_video_capture(url):
+    """주어진 URL 또는 ID를 기반으로 cv2.VideoCapture 객체를 반환합니다."""
     try:
-        if "youtube.com" in url or "youtu.be" in url:
+        # 1. URL이 정수(로컬 웹캠)인 경우 분리 처리
+        if isinstance(url, int):
+            print("[INFO] 로컬 웹캠 연결 시도 중...")
+            cap = cv2.VideoCapture(url)  # cv2.VideoCapture(0) 실행
+            # 로컬 웹캠은 초기화에 시간이 걸릴 수 있음
+            if cap.isOpened():
+                return cap
+            else:
+                return None
+
+        # 2. URL이 문자열이고 유튜브인 경우
+        if isinstance(isinstance(url, str) and ("youtube.com" in url or "youtu.be" in url)):
             print("[INFO] YouTube 영상 direct URL 추출 중...")
             try:
                 direct_url = get_youtube_direct_url(url)
                 print("[INFO] YouTube direct stream URL:", direct_url)
+                # 추출된 direct_url로 VideoCapture 시도
                 cap = cv2.VideoCapture(direct_url)
                 return cap
             except Exception as e:
-                print("[ERROR] YouTube direct stream load error:", e)
+                print(f"[ERROR] YouTube direct stream load error: {e}")
                 return None
-        else:
+
+        # 3. URL이 문자열이고 IP 카메라인 경우
+        elif isinstance(url, str):
             print("[INFO] IP 카메라 연결 중...")
             cap = cv2.VideoCapture(url)
             return cap
+
+        return None  # 유효하지 않은 URL 타입
+
     except Exception as e:
         print(f"[ERROR] 비디오 캡처 생성 실패: {e}")
         return None
+
 
 # ------ IP 웹캠 연결 반복 시도 : 수정 제안 -------
 def connect_camera_loop():
@@ -445,11 +467,11 @@ def connect_camera_loop():
                 continue
 
             # 현재 로그인 유저 확인
+            url = None
             if current_user_id:
+                # DB에서 현재 사용자 ID의 카메라 URL 조회
                 url = get_camera_url(current_user_id)
                 print(f"[DEBUG] 로그인된 사용자({current_user_id})의 URL: {url}")
-            else:
-                url = None
 
             # 로그인되어 있지 않거나 URL이 잘못된 경우 → 기본 카메라로 시도
             if not url or not isinstance(url, str) or not url.strip():
@@ -460,6 +482,7 @@ def connect_camera_loop():
             temp_cap = get_video_capture(url)
             if temp_cap and temp_cap.isOpened():
                 cap = temp_cap
+                # 실제 FPS 값을 가져와서 설정 (대부분의 웹캠/IP캠은 30)
                 fps_val = int(cap.get(cv2.CAP_PROP_FPS))
                 fps = fps_val if fps_val > 0 else 30
                 print(f"[INFO] 카메라 연결 성공 (FPS: {fps})")
@@ -468,7 +491,8 @@ def connect_camera_loop():
                 time.sleep(3)
                 continue
 
-            time.sleep(1 / fps if fps > 0 else 0.03)
+            # 캡처 루프가 끊기지 않도록 대기
+            time.sleep(1)
 
         except Exception as e:
             print(f"[ERROR] connect_camera_loop 예외 발생: {e}")
@@ -483,16 +507,20 @@ def capture_frames():
     fail_count = 0
 
     while True:
+        # 카메라 연결 상태 확인 및 대기
         if cap is None or not cap.isOpened():
             # 빈 프레임 생성 후 대기
             frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            # 텍스트 오버레이 (연결 대기)
+            cv2.putText(frame, "Waiting for Camera Connection...", (100, 240),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             with frame_lock:
                 latest_frame = frame.copy()
             time.sleep(0.2)
             continue
 
         try:
-            # ✅ 안정형: grab을 과도하게 하지 않음
+            # 프레임 읽기
             ret, frame = cap.read()
 
             if not ret or frame is None:
@@ -501,10 +529,10 @@ def capture_frames():
                 if fail_count > 10:
                     print("[ERROR] 스트림이 끊긴 것으로 판단, 재연결 시도 예정")
                     cap.release()
-                    cap = None
+                    cap = None  # None으로 설정하여 connect_camera_loop가 재시도하도록 유도
                 time.sleep(0.1)
                 continue
-            fail_count = 0
+            fail_count = 0  # 성공 시 카운트 리셋
 
             # 프레임 리사이즈
             frame = cv2.resize(frame, (640, 480))
@@ -513,28 +541,34 @@ def capture_frames():
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(rgb_frame)
 
+            calculated = {}
             if results.pose_landmarks:
                 row = {'frame': frame_idx}
                 for i, lm in enumerate(results.pose_landmarks.landmark):
+                    # 랜드마크 좌표 추출 (MediaPipe는 0~1 사이의 정규화된 좌표를 반환)
                     row[f'kp{i}_x'] = lm.x
                     row[f'kp{i}_y'] = lm.y
                     row[f'kp{i}_z'] = lm.z
                     row[f'kp{i}_visibility'] = lm.visibility
 
                 df = pd.DataFrame([row])
+
+                # 중심 동역학 계산
                 center_df = compute_center_dynamics(df, fps=fps)
                 center_info = center_df.iloc[-1].to_dict()
 
+                # 데이터 전처리
                 keypoints = [f'kp{i}' for i in range(len(results.pose_landmarks.landmark))]
-                df = smooth_with_kalman(df, keypoints)
-                df = centralize_kp(df, pelvis_idx=(23, 24))
-                df = scale_normalize_kp(df, ref_joints=(23, 24))
+                df = smooth_with_kalman(df, keypoints)  # 칼만 필터
+                df = centralize_kp(df, pelvis_idx=(23, 24))  # 중심 정렬
+                df = scale_normalize_kp(df, ref_joints=(23, 24))  # 스케일 정규화
 
                 row_processed = df.iloc[0].to_dict()
                 calculated = calculate_angles(row_processed, fps=fps)
                 calculated.update(center_info)
 
                 try:
+                    # AI 예측을 위한 피처 추출 및 준비
                     feature_cols = [col for col in calculated.keys() if (
                             "angle" in col.lower() or
                             "angular_velocity" in col.lower() or
@@ -543,16 +577,16 @@ def capture_frames():
                     )]
 
                     X = pd.DataFrame([[calculated[col] for col in feature_cols]], columns=feature_cols).fillna(0.0)
-                    # S3 모델 로드 실패 시 더미 스케일러/모델을 사용하므로,
-                    # 실제 로드 성공 시에만 reindex를 적용함.
+
+                    # 로드된 스케일러의 피처 순서에 맞춰 데이터 정렬 및 누락된 피처 0으로 채우기
                     if hasattr(scaler, 'feature_names_in_'):
                         X = X.reindex(columns=scaler.feature_names_in_, fill_value=0.0)
 
                     X_scaled = scaler.transform(X)
-                    pred = model.predict_proba(X_scaled)
-                    pred_label = model.predict(X_scaled)
+                    pred = model.predict_proba(X_scaled)  # 확률 예측
+                    pred_label = model.predict(X_scaled)  # 레이블 예측
 
-                    score = float(pred[0][1] * 100)
+                    score = float(pred[0][1] * 100)  # 낙상 확률 (1에 대한 확률)
                     label = int(pred_label[0])
 
                     calculated["risk_score"] = score
@@ -560,14 +594,21 @@ def capture_frames():
                     latest_score = score
                     latest_label = "Fall" if label == 1 else "Normal"
 
+                    # 낙상 감지 시 알람 로직
+                    if label == 1:
+                        # play_alarm_sound() # 실제로 소리 재생을 원할 경우 주석 해제 (EC2에서 소리가 나진 않음)
+                        print("🚨 낙상 감지됨: Alarm Triggered")
+
+
                 except Exception as e:
                     print("⚠️ 실시간 예측 오류:", e)
                     calculated["risk_score"] = 0.0
                     calculated["Label"] = 0
 
-                calculated['user_id'] = current_user_id  # DB 저장을 위해 user_id 추가
-                # DB 저장
-                save_to_db(calculated)
+                calculated['user_id'] = current_user_id if current_user_id else "anonymous"  # DB 저장을 위해 user_id 추가
+                # DB 저장 (로그인된 사용자 ID가 있는 경우에만 실행)
+                if current_user_id:
+                    save_to_db(calculated)
 
                 # MediaPipe 랜드마크를 프레임에 그림
                 mp_drawing = mp.solutions.drawing_utils
@@ -581,6 +622,10 @@ def capture_frames():
 
             # 최신 프레임 저장 (lock으로 보호)
             with frame_lock:
+                # 프레임에 현재 상태 정보 추가 (디버깅용)
+                status_text = f"Status: {latest_label} (Score: {latest_score:.2f}%)"
+                cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
                 latest_frame = frame.copy()
                 frame_idx += 1
 
@@ -589,11 +634,13 @@ def capture_frames():
             time.sleep(0.2)
 
         # FPS 제어
+        # 영상 스트림의 FPS를 따르거나, 최소 25FPS를 보장하도록 대기
         time.sleep(1 / fps if fps > 0 else 1 / 25)
 
 
 # ------ Flask MJPEG 스트리밍 : 수정 제안 --------
 empty_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
 
 def gen_frames():
     global latest_frame
@@ -630,6 +677,11 @@ def gen_frames():
 # 홈 (로그인 페이지)
 @app.route('/')
 def home():
+    # 로그아웃 상태 유지
+    session.pop('user_id', None)
+    global current_user_id
+    current_user_id = None
+
     return render_template('login.html')
 
 
@@ -644,14 +696,17 @@ def login():
     if conn is None:
         return render_template('login.html', error_msg="DB 연결 실패. 관리자에게 문의하세요.")
 
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id=%s AND password=%s", (user_id, password))
-    user = cursor.fetchone()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE id=%s AND password=%s", (user_id, password))
+        user = cursor.fetchone()
+    finally:
+        conn.close()
 
     if user:
         session['user_id'] = user_id
         current_user_id = user_id  # 스레드에서 사용 가능
+        print(f"[INFO] User {user_id} logged in. Current camera loop will try to connect to user's URL.")
         return redirect('/camera')
     else:
         # 로그인 실패 시 로그인 페이지 다시 렌더링 + 에러 메시지 전달
@@ -674,29 +729,33 @@ def register():
         if conn is None:
             return render_template('register.html', error_msg="DB 연결 실패. 관리자에게 문의하세요.")
 
-        cursor = conn.cursor()
+        try:
+            cursor = conn.cursor()
 
-        # 서버 측 아이디 중복 체크
-        cursor.execute("SELECT id FROM users WHERE id = %s", (id,))
-        if cursor.fetchone():  # 이미 존재하면
+            # 서버 측 아이디 중복 체크
+            cursor.execute("SELECT id FROM users WHERE id = %s", (id,))
+            if cursor.fetchone():  # 이미 존재하면
+                return render_template('register.html', error_msg="이미 존재하는 아이디입니다.")
+
+            # users 테이블에 삽입
+            cursor.execute("""
+                INSERT INTO users (id, password, username, phone_number, non_guardian_name, mail)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (id, password, username, phone_number, non_guardian_name, mail))
+
+            # cameras 테이블에 삽입
+            cursor.execute("""
+                INSERT INTO cameras (user_id, camera_url)
+                VALUES (%s, %s)
+            """, (id, camera_url))
+
+            conn.commit()
+            return redirect('/')
+        except Exception as e:
+            conn.rollback()
+            return render_template('register.html', error_msg=f"회원가입 중 DB 오류 발생: {e}")
+        finally:
             conn.close()
-            return render_template('register.html', error_msg="이미 존재하는 아이디입니다.")
-
-        # users 테이블에 삽입
-        cursor.execute("""
-            INSERT INTO users (id, password, username, phone_number, non_guardian_name, mail)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (id, password, username, phone_number, non_guardian_name, mail))
-
-        # cameras 테이블에 삽입
-        cursor.execute("""
-            INSERT INTO cameras (user_id, camera_url)
-            VALUES (%s, %s)
-        """, (id, camera_url))
-
-        conn.commit()
-        conn.close()
-        return redirect('/')
 
     return render_template('register.html')
 
@@ -712,11 +771,13 @@ def check_id():
         if conn is None:
             return jsonify({"exists": False, "error": "DB_CONNECTION_FAILED"})
 
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM users WHERE id = %s", (user_id,))
-        if cursor.fetchone():
-            exists = True
-        conn.close()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+            if cursor.fetchone():
+                exists = True
+        finally:
+            conn.close()
 
     return jsonify({"exists": exists})
 
@@ -725,6 +786,10 @@ def check_id():
 @app.route('/camera')
 def index():
     user_id = session.get('user_id')
+    # 로그인 상태가 아니면 로그인 페이지로 리다이렉트
+    if not user_id:
+        return redirect('/')
+
     camera_url = None
     is_youtube = False
     embed_url = None
@@ -738,23 +803,30 @@ def index():
 
                 # embed URL 변환
                 video_id = None
+                parsed_url = urlparse(camera_url)
+
                 if "youtube.com/watch" in camera_url:
-                    query = parse_qs(urlparse(camera_url).query)
+                    query = parse_qs(parsed_url.query)
                     video_id = query.get("v", [None])[0]
                 elif "youtu.be" in camera_url:
                     # 'youtu.be/video_id' 형태 처리
-                    video_id = camera_url.split("/")[-1].split("?")[0]
+                    video_id = parsed_url.path.strip("/")
                 elif "youtube.com/shorts" in camera_url:
                     # 'shorts/video_id' 형태 처리
-                    video_id = camera_url.split("/")[-1].split("?")[0]
+                    video_id = parsed_url.path.split("/")[-1]
 
                 if video_id:
                     # &autoplay=1 추가: 영상 자동 재생
-                    embed_url = f"https://www.youtube.com/embed/{video_id}?autoplay=1"
+                    # loop=1과 playlist=video_id를 추가하여 자동 반복 재생 시도
+                    embed_url = f"https://www.youtube.com/embed/{video_id}?autoplay=1&loop=1&playlist={video_id}"
                 else:
                     # 영상 ID 못 찾으면 유튜브 처리 취소
                     is_youtube = False
                     embed_url = None
+
+        # current_user_id 전역 변수 설정 (스레드 동기화)
+        global current_user_id
+        current_user_id = user_id
 
     return render_template('camera.html',
                            user_id=user_id,  # 사용자 ID 전달
@@ -772,17 +844,18 @@ def video_feed():
 
 # ----- 낙상 위험 점수 기반 알림 로직 추가 ------
 def play_alarm_sound():
-    """🔊 서버 스피커에서 경고음 재생"""
+    """🔊 서버 스피커에서 경고음 재생 (EC2 환경에서는 작동하지 않을 가능성이 높음)"""
 
     def _play():
         try:
             # playsound 모듈은 EC2 서버 환경에서 소리가 나지 않을 수 있음
+            # 로컬에서만 테스트용으로 활용
             playsound("static/alarmclockbeepsaif.mp3")
             print("🔊 Alarm sound played!")
         except Exception as e:
             print(f"❌ Alarm Sound Error: {e}")
 
-    # 알림 발생시 Flask가 멈춤을 대비 -> 별로 스레드 생성
+    # 알림 발생시 Flask가 멈춤을 대비 -> 별도 스레드 생성
     threading.Thread(target=_play, daemon=True).start()
 
 
@@ -800,13 +873,14 @@ def get_score():
         )
 
         if df.empty:
-            return jsonify({"risk_score": 0.0})  # 데이터 없으면 0 반환
+            # 전역 변수를 사용하거나, 데이터가 없으면 0 반환
+            return jsonify({"risk_score": latest_score})
 
         return jsonify({"risk_score": round(df['risk_score'].iloc[0], 2)})
 
     except Exception as e:
         print(f"❌ get_score 조회 오류: {e}")
-        return jsonify({"risk_score": 0.0})
+        return jsonify({"risk_score": latest_score})  # DB 오류 시 실시간 메모리 값 반환
 
 
 # ==========================
@@ -826,4 +900,5 @@ if __name__ == "__main__":
     threading.Thread(target=capture_frames, daemon=True).start()
 
     # 배포시 변경 사항 (debug=False, use_reloader=False)
+    # AWS EC2 환경에서 0.0.0.0과 5000 포트 사용
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
