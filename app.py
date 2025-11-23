@@ -9,7 +9,6 @@ from datetime import datetime
 import pandas as pd
 import joblib
 from pykalman import KalmanFilter
-from playsound import playsound
 import os
 from urllib.parse import quote_plus
 from sqlalchemy import create_engine
@@ -41,8 +40,8 @@ if not all([DB_HOST, DB_PASSWORD]):
 s3 = boto3.client('s3')
 BUCKET_NAME = 'swu-sw-02-s3'  # 사용자님의 S3 버킷 이름
 
-
-def load_from_s3(key_name):
+# 모델 로드
+def load_model_from_s3(key_name):
     """S3에서 파일을 로드하여 joblib으로 디시리얼라이즈합니다."""
     # S3에서 파일을 객체로 가져옴 (BUCKET_NAME 변수 사용으로 개선)
     response = s3.get_object(Bucket=BUCKET_NAME, Key=key_name)
@@ -51,13 +50,35 @@ def load_from_s3(key_name):
     # joblib을 사용하여 메모리에서 모델을 로드
     return joblib.load(model_data)
 
+# S3애서 파일을 다운로드하여 로컬로 저장
+def download_from_s3_to_local(key_name, local_path):
+    """S3에서 파일을 로드하여 로컬 파일 시스템에 저장합니다."""
+    try:
+        s3.download_file(BUCKET_NAME, key_name, local_path)
+        print(f"✅ S3 파일 '{key_name}'이 로컬 '{local_path}'에 다운로드되었습니다.")
+        return True
+    except Exception as e:
+        print(f"❌ ERROR: Failed to download '{key_name}' from S3. Error: {e}")
+        return False
+
+# 로컬 임시 파일 경로 설정
+LOCAL_VIDEO_PATH = "/tmp/fall1.mp4" # /tmp는 EC2에서 쓰기 권한이 있는 임시 디렉토리
 
 try:
     # S3에서 모델 파일 로드
-    scaler = load_from_s3("scaler.pkl")
-    model = load_from_s3("decision_tree_model.pkl")
-    video_source = load_from_s3("fall1.mp4")
+    scaler = load_model_from_s3("scaler.pkl")
+    model = load_model_from_s3("decision_tree_model.pkl")
+
+    # 🔑 비디오 파일 로드 로직 수정
+    if download_from_s3_to_local("fall1.mp4", LOCAL_VIDEO_PATH):
+        video_source = LOCAL_VIDEO_PATH  # cv2.VideoCapture가 사용할 로컬 경로
+    else:
+        # 다운로드 실패 시 대체 경로 또는 에러 처리
+        video_source = "static/fall1.mp4"  # (로컬 테스트용)
+        print("⚠️ S3 비디오 파일 다운로드에 실패했습니다. 로컬 경로를 대체 사용합니다.")
+
     print("✅ AI Models loaded successfully from S3.")
+
 except Exception as e:
     print(f"❌ ERROR: Failed to load models from S3. Check file names and S3 permissions. Error: {e}")
 
@@ -440,13 +461,13 @@ def capture_frames():
 
             if not ret or frame is None:
                 fail_count += 1
-                if fail_count > 10:
-                    print("[ERROR] 스트림이 끊긴 것으로 판단, 재연결 시도 예정")
-                    if cap: cap.release()
-                    cap = None
-                    fail_count = 0
-                time.sleep(0.1)
-                continue
+                if cap.get(cv2.CAP_PROP_POS_FRAMES) >= cap.get(cv2.CAP_PROP_FRAME_COUNT) - 1:
+                    # 비디오 파일의 끝에 도달하면 0 프레임으로 되돌림 (루프)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    print("[INFO] 비디오 파일 루프 재시작")
+                    fail_count = 0  # 재시작했으니 실패 횟수 초기화
+                    time.sleep(0.01)
+                    continue
 
             fail_count = 0
 
@@ -656,17 +677,6 @@ def video_feed():
     return Response(gen_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
-# ----- 낙상 위험 점수 기반 알림 로직 추가 ------
-def play_alarm_sound():
-    """🔊 서버 스피커에서 경고음 재생"""
-    def _play():
-        try:
-            playsound("static/alarmclockbeepsaif.mp3")
-            print("🔊 Alarm sound played!")
-        except Exception as e:
-            print(f"❌ Alarm Sound Error: {e}")
-    # 알림 발생시 Flask가 멈춤을 대비 -> 별로 스레드 생성
-    threading.Thread(target=_play, daemon=True).start()
 
 # ----- 새로운 위험도 확인 라우트 ------
 @app.route('/get_score')
