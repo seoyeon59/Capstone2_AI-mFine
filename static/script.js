@@ -44,7 +44,7 @@ window.addEventListener("DOMContentLoaded", () => {
   }
 
   // 1초마다 위험 점수 업데이트
-  setInterval(fetchRiskScore, 1000);
+  setInterval(fetchRiskScore, 2000);
   fetchRiskScore(); // 초기 실행
 
   // 119 신고 팝업

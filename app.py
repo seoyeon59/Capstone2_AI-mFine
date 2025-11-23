@@ -681,17 +681,33 @@ def video_feed():
 # ----- 새로운 위험도 확인 라우트 ------
 @app.route('/get_score')
 def get_score():
+    # 🔑 최근 N초 동안의 평균 위험 점수를 계산
+    N_SECONDS = 2
     try:
-        # SQLAlchemy 엔진으로 직접 읽기
-        df = pd.read_sql_query(
-            "SELECT risk_score FROM realtime_screen ORDER BY timestamp DESC LIMIT 1",
-            con=engine
-        )
+        # 최근 1초 동안의 데이터를 모두 불러옴 (MySQL 문법)
+        # TIMESTAMPADD(SECOND, -N_SECONDS, NOW())는 현재 시간으로부터 N초 전 시간을 의미
+        query = f"""
+                SELECT risk_score 
+                FROM realtime_screen 
+                WHERE timestamp >= TIMESTAMPADD(SECOND, -{N_SECONDS}, NOW())
+                ORDER BY timestamp DESC
+            """
+        df = pd.read_sql_query(query, con=engine)
 
         if df.empty:
-            return jsonify({"risk_score": 0.0})  # 데이터 없으면 0 반환
+            # 최근 1초간 데이터가 없으면, 가장 최근의 데이터라도 가져옴
+            df = pd.read_sql_query(
+                "SELECT risk_score FROM realtime_screen ORDER BY timestamp DESC LIMIT 1",
+                con=engine
+            )
 
-        return jsonify({"risk_score": round(df['risk_score'].iloc[0], 2)})
+        if df.empty:
+            avg_score = 0.0
+        else:
+            # 🔑 불러온 모든 점수의 평균을 계산
+            avg_score = df['risk_score'].mean()
+
+        return jsonify({"risk_score": round(avg_score, 2)})
 
     except Exception as e:
         print(f"❌ get_score 조회 오류: {e}")
