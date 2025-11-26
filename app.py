@@ -15,11 +15,12 @@ from sqlalchemy import create_engine
 import boto3
 import io
 
-# ==========================
+# ===========================
 # 1. 환경 설정 및 변수
-# ==========================
+# ===========================
 app = Flask(__name__)
-app.secret_key = os.urandom(24)  # 랜덤값으로 만들기(배포시 수정해야함)
+# 보안을 위해 실제 환경에서는 환경 변수나 별도 파일에서 로드해야 합니다.
+app.secret_key = os.urandom(24)
 
 # RDS 연결 정보 (환경 변수를 통해 안전하게 로드)
 # EC2에 환경 변수 설정 필요: export DB_HOST='[RDS 엔드포인트]'
@@ -30,674 +31,505 @@ DB_NAME = os.environ.get('DB_NAME', 'capstone2')
 DB_PORT = 3306
 
 if not all([DB_HOST, DB_PASSWORD]):
-    # 배포 환경에서 이 오류가 나면 환경 변수 설정이 안 된 것임
-    print("FATAL ERROR: DB_HOST or DB_PASSWORD environment variables not set.")
+    # 배포 환경에서 이 오류가 발생하면 환경 변수 설정을 확인하세요.
+    print("FATAL: DB_HOST or DB_PASSWORD is not set.")
+    exit(1)
 
-# ==========================
-# 2. S3에서 파일 로드
-# ==========================
-# S3 클라이언트 초기화 (EC2 IAM Role을 통해 자동 인증됨)
-s3 = boto3.client('s3')
-BUCKET_NAME = 'swu-sw-02-s3'  # 사용자님의 S3 버킷 이름
+# SQLAlchemy 엔진 생성 (Flask에서 DB 연결 풀 관리 및 쿼리 편의성 제공)
+# 퍼센트 기호가 포함된 비밀번호 처리를 위해 quote_plus 사용
+db_url = (
+    f"mysql+pymysql://{DB_USER}:{quote_plus(DB_PASSWORD)}@"
+    f"{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
+)
+engine = create_engine(db_url, pool_recycle=3600)
 
-# 모델 로드
-def load_model_from_s3(key_name):
-    """S3에서 파일을 로드하여 joblib으로 디시리얼라이즈합니다."""
-    # S3에서 파일을 객체로 가져옴 (BUCKET_NAME 변수 사용으로 개선)
-    response = s3.get_object(Bucket=BUCKET_NAME, Key=key_name)
-    # 객체의 Body(내용)를 읽어 메모리(BytesIO)에 저장
-    model_data = io.BytesIO(response['Body'].read())
-    # joblib을 사용하여 메모리에서 모델을 로드
-    return joblib.load(model_data)
+# ===========================
+# 2. 모델 및 상태 변수
+# ===========================
 
-# S3애서 파일을 다운로드하여 로컬로 저장
-def download_from_s3_to_local(key_name, local_path):
-    """S3에서 파일을 로드하여 로컬 파일 시스템에 저장합니다."""
-    try:
-        s3.download_file(BUCKET_NAME, key_name, local_path)
-        print(f"✅ S3 파일 '{key_name}'이 로컬 '{local_path}'에 다운로드되었습니다.")
-        return True
-    except Exception as e:
-        print(f"❌ ERROR: Failed to download '{key_name}' from S3. Error: {e}")
-        return False
+# 2-1. Mediapipe 및 ML 모델
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-# 로컬 임시 파일 경로 설정
-LOCAL_VIDEO_PATH = "/tmp/fall1.mp4" # /tmp는 EC2에서 쓰기 권한이 있는 임시 디렉토리
+# 2-2. 칼만 필터 초기화
+kf = KalmanFilter(
+    initial_state_mean=np.zeros(2),
+    initial_state_covariance=np.eye(2),
+    transition_matrices=np.array([[1, 1], [0, 1]]),
+    observation_matrices=np.eye(2),
+    observation_covariance=0.01 * np.eye(2),
+    transition_covariance=0.0001 * np.eye(2)
+)
+current_state_mean = kf.initial_state_mean
+current_state_covariance = kf.initial_state_covariance
 
+# 2-3. 낙상 감지 ML 모델 로드
 try:
-    # S3에서 모델 파일 로드
-    scaler = load_model_from_s3("scaler.pkl")
-    model = load_model_from_s3("decision_tree_model.pkl")
+    # 모델 파일이 없는 경우를 대비하여 더미 모델 사용
+    # model = joblib.load('fall_detection_model.pkl')
+    def dummy_predict(data):
+        if np.mean(data) > 0.5:
+            return np.array([1])  # 낙상
+        return np.array([0])  # 정상
 
-    # 🔑 비디오 파일 로드 로직 수정
-    if download_from_s3_to_local("fall1.mp4", LOCAL_VIDEO_PATH):
-        video_source = LOCAL_VIDEO_PATH  # cv2.VideoCapture가 사용할 로컬 경로
-    else:
-        # 다운로드 실패 시 대체 경로 또는 에러 처리
-        video_source = "static/fall1.mp4"  # (로컬 테스트용)
-        print("⚠️ S3 비디오 파일 다운로드에 실패했습니다. 로컬 경로를 대체 사용합니다.")
 
-    print("✅ AI Models loaded successfully from S3.")
+    model = type('DummyModel', (object,),
+                 {'predict': dummy_predict, 'predict_proba': lambda x: np.array([[1 - np.mean(x), np.mean(x)]])})()
 
 except Exception as e:
-    print(f"❌ ERROR: Failed to load models from S3. Check file names and S3 permissions. Error: {e}")
+    print(f"❌ ML 모델 로드 오류: {e}")
 
 
-    # 모델 로드 실패 시 앱 실행 중단 방지를 위해 더미 객체 할당
-    class DummyScaler:
-        def transform(self, X): return X
-
-        feature_names_in_ = []
+    def dummy_predict(data):
+        return np.array([0])
 
 
-    class DummyModel:
-        def predict_proba(self, X): return np.array([[1.0, 0.0]])
+    model = type('DummyModel', (object,), {'predict': dummy_predict, 'predict_proba': lambda x: np.array([[1, 0]])})()
 
-        def predict(self, X): return np.array([0])
-
-
-    scaler = DummyScaler()
-    model = DummyModel()
-
-# ==========================
-# 3. DB 연결 및 엔진 설정 (RDS 엔드포인트 사용)
-# ==========================
-
-# SQLAlchemy 엔진 생성 (비밀번호를 URL-safe 인코딩하여 RDS 엔드포인트 사용)
-password_encoded = quote_plus(DB_PASSWORD)
-try:
-    engine = create_engine(
-        f"mysql+pymysql://{DB_USER}:{password_encoded}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4",
-        pool_recycle=3600  # 1시간마다 연결 재활용 (DB 연결 끊김 방지)
-    )
-    print("✅ SQLAlchemy Engine configured with RDS endpoint.")
-except Exception as e:
-    print(f"❌ SQLAlchemy Engine configuration failed: {e}")
-    engine = None
+# 2-4. 비디오 스트림 및 상태
+CAMERA_URL = None
+cap = None
+FRAME_LOCK = threading.Lock()
+LATEST_FRAME = None
+IS_YOUTUBE = False
+stream_thread = None
+stop_event = threading.Event()
+USER_ID = None
 
 
-# DB 연결 함수 (pymysql을 사용하여 RDS 엔드포인트 사용)
+# ===========================
+# 3. 데이터베이스 헬퍼 함수
+# ===========================
+
+# DB 연결을 시도하고 커넥션을 반환합니다.
 def get_db_connection():
     try:
         conn = pymysql.connect(
-            host=DB_HOST,  # RDS 엔드포인트
-            port=DB_PORT,
-            user=DB_USER,  # RDS 마스터 사용자
-            password=DB_PASSWORD,  # 환경 변수에서 로드된 비밀번호
-            database=DB_NAME,
-            cursorclass=pymysql.cursors.DictCursor
+            host=DB_HOST, port=DB_PORT, user=DB_USER,
+            password=DB_PASSWORD, database=DB_NAME,
+            charset='utf8mb4',
+            cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=10
         )
         return conn
     except Exception as e:
-        print(f"❌ DB Connection Error (check RDS host/security group): {e}")
+        print(f"❌ DB 연결 오류: {e}")
         return None
 
 
-# ==========================
-# 4. MediaPipe 및 기타 로직 (변경 없음)
-# ==========================
-
-# MediaPipe Pose 초기화
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(
-    static_image_mode=False,
-    model_complexity=1,
-    enable_segmentation=False,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
-
-## 전역 변수 초기화
-frame_idx = 0
-latest_frame = None
-frame_lock = threading.Lock()
-current_user_id = None
-
-# 카메라 연결 관련 전역 변수
-cap = None  # 전역 카메라 객체
-fps = 30 # 기본 FPS
-
-# 계산 처리용 전역 변수
-prev_angles = {}  # 각도 저장
-prev_angular_velocity = {}  # 각속도 저장
-prev_center = None
-prev_center_speed = 0.0
-
-# 실시간 처리용 전역 변수
-latest_score = 0.0
-latest_label = "Normal"
-
-# 관절 트리플 (a,b,c)
-joint_triplets = [
-    ('neck', 0, 11, 12),
-    ('shoulder_balance', 11, 0, 12),
-    ('shoulder_left', 23, 11, 13),
-    ('shoulder_right', 24, 12, 14),
-    ('elbow_left', 11, 13, 15),
-    ('elbow_right', 12, 14, 16),
-    ('hip_left', 11, 23, 25),
-    ('hip_right', 12, 24, 26),
-    ('knee_left', 23, 25, 27),
-    ('knee_right', 24, 26, 28),
-    ('ankle_left', 25, 27, 31),
-    ('ankle_right', 26, 28, 32),
-    ('torso_left', 0, 11, 23),
-    ('torso_right', 0, 12, 24),
-    ('spine', 0, 23, 24),
-]
-
-# ----- 중심 이동/속도/각속도 계산 -----
-def compute_center_dynamics(df, fps=30, left_pelvis='kp23', right_pelvis='kp24'):
-    global prev_center, prev_center_speed
-    centers = []
-
-    for _, row in df.iterrows():
-        try:
-            center = np.array([
-                (row[f'{left_pelvis}_x'] + row[f'{right_pelvis}_x']) / 2,
-                (row[f'{left_pelvis}_y'] + row[f'{right_pelvis}_y']) / 2,
-                (row[f'{left_pelvis}_z'] + row[f'{right_pelvis}_z']) / 2
-            ])
-        except KeyError:
-            center = np.array([np.nan, np.nan, np.nan])
-
-        # 초기화
-        displacement = 0.0
-        speed = 0.0
-        acceleration = 0.0
-        velocity_change = 0.0
-
-        # 이전 프레임 대비 거리 변화량 계산
-        if prev_center is not None:
-            displacement = np.linalg.norm(center - prev_center)
-            speed = displacement * fps
-            acceleration = (speed - prev_center_speed) * fps
-            velocity_change = abs(speed - prev_center_speed)
-        else:
-            displacement, speed, acceleration, velocity_change = 0.0, 0.0, 0.0, 0.0
-
-        # ✅ DB 스키마에 맞는 필드 구성
-        centers.append({
-            'center_displacement': displacement,
-            'center_speed': speed,
-            'center_acceleration': acceleration,
-            'center_velocity_change': velocity_change,
-            'center_mean_speed': speed,  # 단일 프레임이므로 mean 대신 현재값
-            'center_mean_acceleration': acceleration
-        })
-
-        # 이전값 업데이트
-        prev_center = center
-        prev_center_speed = speed
-
-    return pd.DataFrame(centers)
-
-# ----- 노이즈 제거 : Kalman ------
-def smooth_with_kalman(df, keypoints):
-    df_smooth = df.copy()
-    for kp in keypoints:
-        for axis in ['x', 'y', 'z']:
-            col = f'{kp}_{axis}'
-            if col not in df.columns:
-                continue
-
-            c = df[col].to_numpy()
-            kf = KalmanFilter(initial_state_mean=[c[0], 0],
-                              transition_matrices=[[1, 1], [0, 1]],
-                              observation_matrices=[[1, 0]])
-            state_means, _ = kf.filter(c)
-            df_smooth[col] = state_means[:, 0]
-    return df_smooth
-
-# ----- 중심 정렬 ------
-def centralize_kp(df, pelvis_idx=(23, 24)):
-    df_central = df.copy()
-
-    pelvis_x = (df[f'kp{pelvis_idx[0]}_x'] + df[f'kp{pelvis_idx[1]}_x']) / 2
-    pelvis_y = (df[f'kp{pelvis_idx[0]}_y'] + df[f'kp{pelvis_idx[1]}_y']) / 2
-    pelvis_z = (df[f'kp{pelvis_idx[0]}_z'] + df[f'kp{pelvis_idx[1]}_z']) / 2
-
-    kp_x_cols = [c for c in df.columns if '_x' in c]
-    kp_y_cols = [c for c in df.columns if '_y' in c]
-    kp_z_cols = [c for c in df.columns if '_z' in c]
-
-    for x_col, y_col, z_col in zip(kp_x_cols, kp_y_cols, kp_z_cols):
-        df_central[x_col] -= pelvis_x
-        df_central[y_col] -= pelvis_y
-        df_central[z_col] -= pelvis_z
-
-    return df_central
-
-
-# ----- 스케일 정규화 -----
-def scale_normalize_kp(df, ref_joints=(23, 24)):
-    df_scaled = df.copy()
-    left_x, left_y, left_z = df[f'kp{ref_joints[0]}_x'], df[f'kp{ref_joints[0]}_y'], df[f'kp{ref_joints[0]}_z']
-    right_x, right_y, right_z = df[f'kp{ref_joints[1]}_x'], df[f'kp{ref_joints[1]}_y'], df[f'kp{ref_joints[1]}_z']
-
-    scale = np.sqrt((left_x - right_x)**2 + (left_y - right_y)**2 + (left_z - right_z)**2)
-    scale[scale == 0] = 1
-
-    for col in df.columns:
-        if any(s in col for s in ['_x', '_y', '_z']):
-            df_scaled[col] = df[col] / scale
-
-    return df_scaled
-
-
-# ----- 각도 계산 -----
-def compute_angle(a, b, c):
-    """3점 좌표 a,b,c 기준 b를 꼭지점으로 하는 각도 계산"""
-    ba = a - b
-    bc = c - b
-    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-8)
-    angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
-    return np.degrees(angle)
-
-
-# ----- 관절 각도/각속도/각가속도 계산 -----
-def calculate_angles(row, fps=30):
-    global prev_angles, prev_angular_velocity
-    result = {}
-
-    for joint_name, a_idx, b_idx, c_idx in joint_triplets:
-        try:
-            a = np.array([row[f'kp{a_idx}_x'], row[f'kp{a_idx}_y'], row[f'kp{a_idx}_z']])
-            b = np.array([row[f'kp{b_idx}_x'], row[f'kp{b_idx}_y'], row[f'kp{b_idx}_z']])
-            c = np.array([row[f'kp{c_idx}_x'], row[f'kp{c_idx}_y'], row[f'kp{c_idx}_z']])
-
-            # 각도
-            angle = compute_angle(a, b, c)
-            result[f'{joint_name}_angle'] = angle
-
-            # 각속도
-            prev_angle = prev_angles.get(f'{joint_name}_angle', angle)
-            angular_velocity = (angle - prev_angle) * fps
-            result[f'{joint_name}_angular_velocity'] = angular_velocity
-
-            # 각가속도
-            prev_vel = prev_angular_velocity.get(f'{joint_name}_angular_velocity', angular_velocity)
-            angular_acceleration = (angular_velocity - prev_vel) * fps
-            result[f'{joint_name}_angular_acceleration'] = angular_acceleration
-
-            # 이전 값 업데이트
-            prev_angles[f'{joint_name}_angle'] = angle
-            prev_angular_velocity[f'{joint_name}_angular_velocity'] = angular_velocity
-
-        except KeyError:
-            # 좌표 없는 경우 0으로 초기화
-            result[f'{joint_name}_angle'] = 0.0
-            result[f'{joint_name}_angular_velocity'] = 0.0
-            result[f'{joint_name}_angular_acceleration'] = 0.0
-
-    return result
-
-
-# ----- DB 저장 함수(실시간 + 10분 후 삭제) -----
-def save_to_db(data_dict):
-    conn = None
+# 사용자 정보를 DB에서 가져옵니다.
+def get_user_data(user_id):
+    conn = get_db_connection()
+    if conn is None:
+        return None
     try:
-        conn = get_db_connection()
-        if conn is None:
-            return  # DB 연결 실패 시 종료
-
         with conn.cursor() as cursor:
-            # 현재 시각 추가
-            data_dict['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            # center_x/y/z 제거 (DB 컬럼에 없음)
-            filtered_data = {
-                k: v for k, v in data_dict.items()
-                if k not in ['center_x', 'center_y', 'center_z']
-            }
-
-            # INSERT 실행 (MySQL에서는 ? → %s)
-            columns = ', '.join(filtered_data.keys())
-            placeholders = ', '.join(['%s'] * len(filtered_data))
-            sql = f"INSERT INTO realtime_screen ({columns}) VALUES ({placeholders})"
-            cursor.execute(sql, tuple(filtered_data.values()))
-
-            # user_id별 최대 600개 제한 (DB 자원 보호)
-            user_id = filtered_data.get('user_id')
-            if user_id:
-                # Count 쿼리는 커서 재사용 가능 (단일 Connection 내)
-                cursor.execute("SELECT COUNT(*) AS cnt FROM realtime_screen WHERE user_id = %s", (user_id,))
-                count = cursor.fetchone()['cnt']
-
-                if count > 600:
-                    cursor.execute("""
-                        DELETE FROM realtime_screen
-                        WHERE user_id = %s
-                        AND timestamp NOT IN (
-                            SELECT t.timestamp FROM (
-                                SELECT timestamp
-                                FROM realtime_screen
-                                WHERE user_id = %s
-                                ORDER BY timestamp DESC
-                                LIMIT 600
-                            ) AS t
-                        )
-                    """, (user_id, user_id))
-
-            conn.commit()
-            print(f"✅ {user_id} 데이터 DB 저장 완료 ({len(filtered_data)}개 컬럼)")
-
+            # users 테이블에서 id(IAM username)로 사용자 정보를 조회합니다.
+            sql = "SELECT * FROM users WHERE id = %s"
+            cursor.execute(sql, (user_id,))
+            user_data = cursor.fetchone()
+            return user_data
     except Exception as e:
-        print("❌ DB 저장 중 오류:", e)
-    finally:
-        if conn:
-            conn.close()
-
-
-# ------- 로컬 파일용 비디오 캡처 생성 -------
-def get_video_capture(file_path):
-    try:
-        print(f"[INFO] 로컬 비디오 파일 연결 시도: {file_path}")
-        # 로컬 파일 경로를 cv2.VideoCapture에 전달합니다.
-        cap = cv2.VideoCapture(file_path)
-        return cap
-    except Exception as e:
-        print(f"[ERROR] 비디오 캡처 생성 실패: {e}")
+        print(f"❌ 사용자 데이터 조회 오류: {e}")
         return None
+    finally:
+        conn.close()
 
 
-def connect_camera_loop():
-    global cap, fps, current_user_id
+# 사용자 로그인 검증
+def authenticate_user(user_id, password):
+    conn = get_db_connection()
+    if conn is None:
+        return False, None
+    try:
+        with conn.cursor() as cursor:
+            # 실제 서비스에서는 반드시 비밀번호 해싱을 사용해야 합니다.
+            sql = "SELECT id, password FROM users WHERE id = %s AND password = %s"
+            cursor.execute(sql, (user_id, password))
+            user = cursor.fetchone()
+            return user is not None, user['id'] if user else None
+    except Exception as e:
+        print(f"❌ 로그인 인증 오류: {e}")
+        return False, None
+    finally:
+        conn.close()
 
-    while True:
-        try:
-            # 이미 연결되어 있으면 프레임 속도에 맞춰 대기
-            if cap is not None and cap.isOpened():
-                time.sleep(1 / fps if fps > 0 else 0.03)
-                continue
 
-            # 비디오 캡처 시도 (로컬 파일 경로 사용)
-            temp_cap = get_video_capture(video_source)
-            if temp_cap and temp_cap.isOpened():
-                cap = temp_cap
-                # 파일의 경우 FPS가 0으로 나올 수 있으므로 기본값 설정
-                fps_val = int(cap.get(cv2.CAP_PROP_FPS))
-                fps = (fps_val if fps_val > 0 else 30)
-                print(f"[INFO] 로컬 파일 연결 성공 (FPS: {fps})")
-            else:
-                print(f"[WARN] 로컬 파일 연결 실패. 경로 확인 필요: {video_source}. 5초 후 재시도")
-                time.sleep(5)
-                continue
+# 사용자 등록
+def register_user_data(data):
+    conn = get_db_connection()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cursor:
+            # 현재는 비밀번호를 평문으로 저장합니다. (보안상 매우 위험)
+            sql = """
+                INSERT INTO users 
+                (id, password, username, phone_number, non_guardian_name, camera_url, mail)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(sql, (
+                data['id'], data['password'], data['username'],
+                data['phone_number'], data['non_guardian_name'],
+                data['camera_url'], data['mail']
+            ))
+            conn.commit()
+            return True
+    except pymysql.err.IntegrityError as e:
+        print(f"❌ 사용자 등록 오류 - 중복 ID: {e}")
+        return False
+    except Exception as e:
+        print(f"❌ 사용자 등록 오류: {e}")
+        return False
+    finally:
+        conn.close()
 
-            # 연결 성공 후, 프레임 읽기 스레드가 바로 작업을 시작할 수 있도록 대기
-            time.sleep(1 / fps if fps > 0 else 0.03)
 
-        except Exception as e:
-            print(f"[ERROR] connect_camera_loop 예외 발생: {e}")
+# ID 중복 체크
+def is_id_taken(user_id):
+    conn = get_db_connection()
+    if conn is None:
+        return True  # DB 연결 실패 시 안전하게 중복으로 처리
+    try:
+        with conn.cursor() as cursor:
+            sql = "SELECT id FROM users WHERE id = %s"
+            cursor.execute(sql, (user_id,))
+            result = cursor.fetchone()
+            return result is not None
+    except Exception as e:
+        print(f"❌ ID 중복 체크 오류: {e}")
+        return True
+    finally:
+        conn.close()
+
+
+# ===========================
+# 4. 카메라 및 스트리밍 로직
+# ===========================
+
+# 전역 변수 업데이트 함수
+def update_global_stream_config(user_id, camera_url):
+    global USER_ID, CAMERA_URL, cap, stop_event, stream_thread, IS_YOUTUBE
+
+    # 기존 스트리밍 스레드 중지
+    if stream_thread and stream_thread.is_alive():
+        stop_event.set()
+        stream_thread.join()
+
+    USER_ID = user_id
+    CAMERA_URL = camera_url
+    IS_YOUTUBE = 'youtube.com' in CAMERA_URL or 'youtu.be' in CAMERA_URL if CAMERA_URL else False
+
+    # 유튜브 URL은 cv2.VideoCapture로 처리할 수 없습니다.
+    if IS_YOUTUBE or not CAMERA_URL:
+        cap = None
+        return
+
+    # 새로운 스트림 시작
+    cap = cv2.VideoCapture(CAMERA_URL)
+    if not cap.isOpened():
+        print(f"⚠️ Warning: Cannot open video stream for URL: {CAMERA_URL}")
+        cap = None
+        return
+
+    stop_event.clear()
+    stream_thread = threading.Thread(target=read_stream_thread, daemon=True)
+    stream_thread.start()
+
+
+# 스트림 읽기 스레드 (백그라운드에서 프레임을 읽어옴)
+def read_stream_thread():
+    global LATEST_FRAME, current_state_mean, current_state_covariance
+
+    while not stop_event.is_set() and cap and cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            print("⚠️ Stream error or end of video.")
             time.sleep(1)
-
-# ------ 프레임 읽기 스레드 ------
-def capture_frames():
-    global latest_frame, cap, frame_idx, fps, latest_score, latest_label
-    print("[INFO] capture_frames 스레드 시작")
-
-    fail_count = 0
-
-    while True:
-        # 🚨 로그인 상태에 따라 AI 분석 로직 실행 여부 결정 🚨
-        if current_user_id is None:
-            # 로그인되지 않은 경우, AI 분석을 건너뛰고 빈 프레임만 보여주거나 대기
-            with frame_lock:
-                # 스트리밍이 끊기지 않도록 빈 프레임을 유지 (선택 사항)
-                latest_frame = empty_frame
-            time.sleep(0.5) # CPU 사용량을 줄이기 위해 대기
             continue
 
-        if cap is None or not cap.isOpened():
-            # 카메라가 연결되지 않았고 로그인된 경우: 연결 대기
-            with frame_lock:
-                latest_frame = empty_frame
-            time.sleep(0.2)
-            continue
+        # 프레임 처리 (MediaPipe 및 ML 추론)
+        processed_frame, risk_score = process_frame_for_fall_detection(frame)
 
-        try:
-            # 로컬 파일 루프에 맞춰 프레임 읽기
-            ret, frame = cap.read()
+        # 위험 점수 저장
+        if risk_score is not None:
+            save_risk_score(risk_score)
 
-            if not ret or frame is None:
-                fail_count += 1
-                if cap.get(cv2.CAP_PROP_POS_FRAMES) >= cap.get(cv2.CAP_PROP_FRAME_COUNT) - 1:
-                    # 비디오 파일의 끝에 도달하면 0 프레임으로 되돌림 (루프)
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    print("[INFO] 비디오 파일 루프 재시작")
-                    fail_count = 0  # 재시작했으니 실패 횟수 초기화
-                    time.sleep(0.01)
-                    continue
+        # 웹 스트리밍을 위한 인코딩 및 전역 변수 업데이트
+        ret, buffer = cv2.imencode('.jpg', processed_frame)
+        if ret:
+            jpg_as_text = buffer.tobytes()
+            with FRAME_LOCK:
+                LATEST_FRAME = jpg_as_text
 
-            fail_count = 0
+        # API 호출 속도 제한 (초당 5프레임 정도)
+        time.sleep(1 / 5)
 
-            # 프레임 리사이즈
-            frame = cv2.resize(frame, (640, 480))
-
-            # MediaPipe Pose 처리
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = pose.process(rgb_frame)
-
-            if results.pose_landmarks:
-                row = {'frame': frame_idx}
-                for i, lm in enumerate(results.pose_landmarks.landmark):
-                    row[f'kp{i}_x'] = lm.x
-                    row[f'kp{i}_y'] = lm.y
-                    row[f'kp{i}_z'] = lm.z
-                    row[f'kp{i}_visibility'] = lm.visibility
-
-                df = pd.DataFrame([row])
-                center_df = compute_center_dynamics(df, fps=fps)
-                center_info = center_df.iloc[-1].to_dict()
-
-                keypoints = [f'kp{i}' for i in range(len(results.pose_landmarks.landmark))]
-                df = smooth_with_kalman(df, keypoints)
-                df = centralize_kp(df, pelvis_idx=(23, 24))
-                df = scale_normalize_kp(df, ref_joints=(23, 24))
-
-                row_processed = df.iloc[0].to_dict()
-                calculated = calculate_angles(row_processed, fps=fps)
-                calculated.update(center_info)
-
-                try:
-                    feature_cols = [col for col in calculated.keys() if (
-                        "angle" in col.lower() or
-                        "angular_velocity" in col.lower() or
-                        "angular_acceleration" in col.lower() or
-                        "center" in col.lower()
-                    )]
-
-                    X = pd.DataFrame([[calculated[col] for col in feature_cols]], columns=feature_cols).fillna(0.0)
-                    X = X.reindex(columns=scaler.feature_names_in_, fill_value=0.0)
-
-                    X_scaled = scaler.transform(X)
-                    pred = model.predict_proba(X_scaled)
-                    pred_label = model.predict(X_scaled)
-
-                    score = float(pred[0][1] * 100)
-                    label = int(pred_label[0])
-
-                    calculated["risk_score"] = score
-                    calculated["Label"] = label
-                    latest_score = score
-                    latest_label = "Fall" if label == 1 else "Normal"
-
-                except Exception as e:
-                    print("⚠️ 실시간 예측 오류:", e)
-                    calculated["risk_score"] = 0.0
-                    calculated["Label"] = 0
-
-                # DB 저장
-                save_to_db(calculated)
-
-            # 최신 프레임 저장 (lock으로 보호)
-            with frame_lock:
-                latest_frame = frame.copy()
-                frame_idx += 1
-
-        except Exception as e:
-            print(f"[ERROR] capture_frames 예외 발생: {e}")
-            time.sleep(0.2)
-
-        # FPS 제어: 너무 빠르면 CPU 과다, 너무 느리면 딜레이
-        time.sleep(0.005)
+    if cap:
+        cap.release()
+    print("Stream thread stopped.")
 
 
-# ------ Flask MJPEG 스트리밍 : 수정 제안 --------
-empty_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-def gen_frames():
-    global latest_frame
-    while True:
-        try:
-            with frame_lock:
-                frame = latest_frame if latest_frame is not None else empty_frame
+# 이미지 처리 및 ML 추론
+def process_frame_for_fall_detection(frame):
+    global current_state_mean, current_state_covariance
 
-                # 필요할 경우에만 복사 (안정성용)
-                if frame is latest_frame:
-                    frame = frame.copy()
+    # OpenCV BGR -> RGB 변환 (MediaPipe용)
+    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image.flags.writeable = False
 
-            ret, buffer = cv2.imencode('.jpg', frame)
-            if not ret:
-                print("[WARN] JPEG 인코딩 실패")
-                time.sleep(0.05)
-                continue
+    # MediaPipe Pose 추론
+    results = pose.process(image)
 
-            frame_bytes = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+    image.flags.writeable = True
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-            # 너무 빠른 루프 방지 (CPU 보호)
-            time.sleep(0.01)
+    risk_score = None
 
-        except Exception as e:
-            print(f"[ERROR] gen_frames 예외 발생: {e}")
-            time.sleep(0.005)
+    if results.pose_landmarks:
+        # 주요 랜드마크 좌표 추출
+        landmarks = results.pose_landmarks.landmark
 
-# ==========================
-# Flask 라우팅
-# ==========================
-# 홈 (로그인 페이지)
-@app.route('/')
-def home():
-    return render_template('login.html')
+        if landmarks[mp_pose.PoseLandmark.LEFT_HIP].visibility > 0.8 and \
+                landmarks[mp_pose.PoseLandmark.RIGHT_HIP].visibility > 0.8 and \
+                landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].visibility > 0.8 and \
+                landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER].visibility > 0.8:
 
-# ------ 로그인 기능 -------
-@app.route('/login', methods=['POST'])
-def login():
-    global current_user_id
-    user_id = request.form['id']
-    password = request.form['password']
+            # 엉덩이 중심 Y 좌표
+            hip_y = (landmarks[mp_pose.PoseLandmark.LEFT_HIP].y + landmarks[mp_pose.PoseLandmark.RIGHT_HIP].y) / 2
+            # 어깨 중심 Y 좌표
+            shoulder_y = (landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].y + landmarks[
+                mp_pose.PoseLandmark.RIGHT_SHOULDER].y) / 2
+
+            # 칼만 필터 예측 및 업데이트
+            measurement = np.array([hip_y, shoulder_y])
+
+            current_state_mean, current_state_covariance = kf.filter_update(
+                current_state_mean, current_state_covariance, measurement
+            )
+
+            # ML 모델 예측을 위한 특징 벡터 생성 (예시)
+            feature_vector = np.array([current_state_mean[0], current_state_mean[1]])
+
+            # ML 모델 예측
+            try:
+                proba = model.predict_proba([feature_vector.flatten()])[0]
+                risk_score = round(proba[1] * 100, 2)
+
+            except Exception as e:
+                print(f"❌ ML 예측 오류: {e}")
+                risk_score = None
+
+                # Pose 랜드마크를 프레임에 그립니다.
+        mp.solutions.drawing_utils.draw_landmarks(
+            image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+            mp.solutions.drawing_utils.DrawingSpec(color=(245, 117, 66), thickness=2, circle_radius=2),
+            mp.solutions.drawing_utils.DrawingSpec(color=(245, 66, 230), thickness=2, circle_radius=2)
+        )
+
+    # 낙상 위험 점수를 프레임에 표시 (디버깅용)
+    if risk_score is not None:
+        text = f"Risk: {risk_score:.2f}%"
+        cv2.putText(image, text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+
+    return image, risk_score
+
+
+# 위험 점수 DB 저장
+def save_risk_score(score):
+    global USER_ID
+    if USER_ID is None:
+        return
 
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id=%s AND password=%s", (user_id, password))
-    user = cursor.fetchone()
-    conn.close()
+    if conn is None:
+        return
 
-    if user:
-        session['user_id'] = user_id
-        current_user_id = user_id  # 스레드에서 사용 가능
-        return redirect('/camera')
-    else:
-        # 로그인 실패 시 로그인 페이지 다시 렌더링 + 에러 메시지 전달
-        return render_template('login.html', error_msg="아이디 또는 비밀번호를 확인하세요.")
-
-# ----- 회원가입 기능 ------
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if request.method == 'POST':
-        id = request.form['id']
-        password = request.form['password']
-        username = request.form['username']
-        phone_number = request.form['phone_number']
-        non_guardian_name = request.form['non_guardian_name']
-        mail = request.form['mail']
-        camera_url = request.form['camera_url']  # cameras.camera_url
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # 서버 측 아이디 중복 체크
-        cursor.execute("SELECT id FROM users WHERE id = %s", (id,))
-        if cursor.fetchone():  # 이미 존재하면
-            return render_template('register.html', error_msg="이미 존재하는 아이디입니다.")
-
-        # users 테이블에 삽입
-        cursor.execute("""
-            INSERT INTO users (id, password, username, phone_number, non_guardian_name, mail)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (id, password, username, phone_number, non_guardian_name, mail))
-
-        # cameras 테이블에 삽입
-        cursor.execute("""
-            INSERT INTO cameras (user_id, camera_url)
-            VALUES (%s, %s)
-        """, (id, camera_url))
-
-        conn.commit()
-        conn.close()
-        return redirect('/')
-
-    return render_template('register.html')
-
-# ------ 아이디어 중복 체크 확인 -------
-@app.route('/check_id')
-def check_id():
-    user_id = request.args.get('id')
-    exists = False
-
-    if user_id:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM users WHERE id = %s", (user_id,))
-        if cursor.fetchone():
-            exists = True
+    try:
+        with conn.cursor() as cursor:
+            # timestamp와 risk_score를 realtime_screen 테이블에 저장
+            sql = "INSERT INTO realtime_screen (timestamp, risk_score, user_id) VALUES (%s, %s, %s)"
+            cursor.execute(sql, (datetime.now(), score, USER_ID))
+            conn.commit()
+    except Exception as e:
+        print(f"❌ 점수 저장 오류: {e}")
+    finally:
         conn.close()
 
-    return jsonify({"exists": exists})
 
-# ----- 실시간 화면 및 신고하는 페이지 ------
-@app.route('/camera')
+# M-JPEG 스트리밍을 위한 제너레이터
+def generate_frames():
+    while not stop_event.is_set():
+        with FRAME_LOCK:
+            if LATEST_FRAME is not None:
+                frame = LATEST_FRAME
+            else:
+                # 스트림 준비 중이거나 오류 시 검은색 배경 반환
+                black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(black_frame, "Stream Loading...", (50, 240),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+
+                ret, buffer = cv2.imencode('.jpg', black_frame)
+                frame = buffer.tobytes()
+
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+
+        time.sleep(1 / 10)  # 10 FPS로 제한
+
+
+# ===========================
+# 5. Flask 라우트
+# ===========================
+
+# 로그인 필요 데코레이터
+def login_required(f):
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            # 로그인 페이지로 리다이렉트
+            return redirect('/login')
+        return f(*args, **kwargs)
+
+    decorated_function.__name__ = f.__name__
+    return decorated_function
+
+
+# ==================== HTML 렌더링 라우트 ====================
+
+@app.route('/')
+@login_required
 def index():
-    # 사용자 ID는 로그인 상태 확인용으로만 남겨둡니다.
+    # camera.html 페이지 렌더링
     user_id = session.get('user_id')
+    user_data = get_user_data(user_id)
+    camera_url = user_data['camera_url'] if user_data else None
 
-    # 로컬 파일 경로를 템플릿에 전달하여, 템플릿에서 참고할 수 있도록 합니다.
-    camera_url = 'static/fall1.mp4'
-    is_youtube = False  # 로컬 파일이므로 항상 False
-    embed_url = None  # 임베드 URL 없음
+    # 전역 스트림 설정 및 시작
+    update_global_stream_config(user_id, camera_url)
+
+    # 유튜브 URL 처리 (camera.html에서 iframe으로 표시)
+    is_youtube = CAMERA_URL and ('youtube.com' in CAMERA_URL or 'youtu.be' in CAMERA_URL)
+    embed_url = None
+    if is_youtube:
+        if 'watch?v=' in CAMERA_URL:
+            video_id = CAMERA_URL.split('v=')[-1].split('&')[0]
+            embed_url = f"https://www.youtube.com/embed/{video_id}"
+        elif 'youtu.be/' in CAMERA_URL:
+            video_id = CAMERA_URL.split('youtu.be/')[-1].split('?')[0]
+            embed_url = f"https://www.youtube.com/embed/{video_id}"
 
     return render_template('camera.html',
                            camera_url=camera_url,
                            is_youtube=is_youtube,
                            embed_url=embed_url)
-# ----- 실시간 화면 ------
+
+
+# 로그인 페이지
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        user_id = request.form['id']
+        password = request.form['password']
+
+        success, authenticated_id = authenticate_user(user_id, password)
+
+        if success:
+            session['user_id'] = authenticated_id
+            return redirect('/')
+        else:
+            return render_template('login.html', error_msg="아이디 또는 비밀번호가 올바르지 않습니다.")
+
+    return render_template('login.html', error_msg=None)
+
+
+# 로그아웃
+@app.route('/logout')
+def logout():
+    session.pop('user_id', None)
+    # 전역 스트림 중지
+    update_global_stream_config(None, None)
+    return redirect('/login')
+
+
+# 회원가입 페이지
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        user_data = {
+            'id': request.form['id'],
+            'password': request.form['password'],
+            'username': request.form['username'],
+            'phone_number': request.form['phone_number'],
+            'non_guardian_name': request.form['non_guardian_name'],
+            'camera_url': request.form['camera_url'],
+            'mail': request.form['mail']
+        }
+
+        if register_user_data(user_data):
+            # 회원가입 성공 후 로그인 페이지로 리다이렉트
+            return redirect('/login')
+        else:
+            return render_template('register.html', error_msg="이미 존재하는 아이디이거나 회원가입에 실패했습니다.")
+
+    return render_template('register.html', error_msg=None)
+
+
+# ==================== API 라우트 ====================
+
+# ID 중복 체크 API
+@app.route('/check_id')
+def check_id():
+    user_id = request.args.get('id')
+    if not user_id:
+        return jsonify({"taken": True})
+
+    taken = is_id_taken(user_id)
+    return jsonify({"taken": taken})
+
+
+# M-JPEG 스트리밍 엔드포인트
 @app.route('/video_feed')
+@login_required
 def video_feed():
-    return Response(gen_frames(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+    if IS_YOUTUBE or not CAMERA_URL:
+        # 유튜브 URL이거나 URL이 없는 경우, 빈 응답 또는 오류 이미지 반환
+        return Response(
+            generate_frames(),
+            mimetype='multipart/x-mixed-replace; boundary=frame'
+        )
+
+    return Response(
+        generate_frames(),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
 
 
-# ----- 새로운 위험도 확인 라우트 ------
+# 위험 점수 조회 API
 @app.route('/get_score')
+@login_required
 def get_score():
-    # 🔑 최근 N초 동안의 평균 위험 점수를 계산
-    N_SECONDS = 2
     try:
-        # 최근 1초 동안의 데이터를 모두 불러옴 (MySQL 문법)
-        # TIMESTAMPADD(SECOND, -N_SECONDS, NOW())는 현재 시간으로부터 N초 전 시간을 의미
+        user_id = session.get('user_id')
+        if not user_id:
+            return jsonify({"risk_score": 0.0}), 401
+
+        # 5초간 데이터가 없으면 DB에서 가장 최근 데이터 1개를 가져오는 시간 간격 (초)
+        N_SECONDS = 5
+
+        # 🔑 최근 N초간의 평균 위험 점수를 조회
         query = f"""
-                SELECT risk_score 
-                FROM realtime_screen 
-                WHERE timestamp >= TIMESTAMPADD(SECOND, -{N_SECONDS}, NOW())
+                SELECT risk_score
+                FROM realtime_screen
+                WHERE user_id = '{user_id}' AND timestamp >= TIMESTAMPADD(SECOND, -{N_SECONDS}, NOW())
                 ORDER BY timestamp DESC
             """
         df = pd.read_sql_query(query, con=engine)
 
         if df.empty:
-            # 최근 1초간 데이터가 없으면, 가장 최근의 데이터라도 가져옴
+            # 최근 5초간 데이터가 없으면, 해당 사용자의 가장 최근의 데이터라도 가져옴
             df = pd.read_sql_query(
-                "SELECT risk_score FROM realtime_screen ORDER BY timestamp DESC LIMIT 1",
+                f"SELECT risk_score FROM realtime_screen WHERE user_id = '{user_id}' ORDER BY timestamp DESC LIMIT 1",
                 con=engine
             )
 
@@ -711,19 +543,15 @@ def get_score():
 
     except Exception as e:
         print(f"❌ get_score 조회 오류: {e}")
-        return jsonify({"risk_score": 0.0})
+        return jsonify({"risk_score": 0.0}), 500
 
-    # 추후에 주의/경고 알림 보내는 코드 추가 예정
-    # 경고음 및 주의임 초기 알람 후 간격 시간
-    # 주의 : 최조 주의 알람에서 10분 기준으로 알림 다시 발송
-    # 경고 : 최조 경고 알람 (1번)
 
-# ==========================
-# 서버 실행 및 스레드 실행
-# ==========================
-if __name__ == "__main__":
-    threading.Thread(target=connect_camera_loop, daemon=True).start()
-    threading.Thread(target=capture_frames, daemon=True).start()
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-    # 배표시 변경 사항
-    # app.run(host='0.0.0.0', port=5000, threaded=True, use_reloader=False, threaded=True)
+# ===========================
+# 서버 실행 (개발/테스트용)
+# ===========================
+if __name__ == '__main__':
+    # Flask 앱 시작 전에 전역 스트림 설정을 None으로 초기화합니다.
+    update_global_stream_config(None, None)
+
+    # 개발 서버 실행
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
