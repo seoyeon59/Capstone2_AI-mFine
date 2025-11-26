@@ -5,7 +5,9 @@ import pymysql
 import numpy as np
 import threading
 import time
-from datetime import datetime
+import requests
+import json
+from datetime import datetime, timedelta
 import pandas as pd
 import joblib
 from pykalman import KalmanFilter
@@ -94,7 +96,6 @@ except Exception as e:
         def predict_proba(self, X): return np.array([[1.0, 0.0]])
 
         def predict(self, X): return np.array([0])
-
 
     scaler = DummyScaler()
     model = DummyModel()
@@ -539,7 +540,7 @@ def capture_frames():
         time.sleep(0.005)
 
 
-# ------ Flask MJPEG 스트리밍 : 수정 제안 --------
+# ------ Flask MJPEG 스트리밍 --------
 empty_frame = np.zeros((480, 640, 3), dtype=np.uint8)
 def gen_frames():
     global latest_frame
@@ -568,6 +569,95 @@ def gen_frames():
         except Exception as e:
             print(f"[ERROR] gen_frames 예외 발생: {e}")
             time.sleep(0.005)
+
+
+# ==========================
+# 5. SNS 알림 연동 로직
+# ==========================
+
+# 🔑 [주의] 3단계에서 복사한 API Gateway 주소를 여기에 붙여넣으세요!
+LAMBDA_INVOKE_URL = "https://vuxwueif4c.execute-api.ap-northeast-2.amazonaws.com/default/lambda_monitor"
+
+# 알림 간격 설정 (요구사항 반영)
+ALERT_INTERVAL_MINUTES = 10
+# 경고: 최초 1회 발송 기록 파일 (EC2 쓰기 가능 영역인 /tmp 사용)
+WARNING_ALERT_SENT_FILE = '/tmp/warning_alert_sent.txt'
+# 주의: 마지막 발송 시간 기록 파일 (EC2 쓰기 가능 영역인 /tmp 사용)
+CAUTION_ALERT_TIME_FILE = '/tmp/last_caution_alert.txt'
+
+
+def send_to_lambda(user_id, predicted_score):
+    """위험 점수와 사용자 ID를 AWS Lambda 함수에 전송"""
+    if not LAMBDA_INVOKE_URL.startswith("http"):
+        print("❌ Lambda URL이 설정되지 않았습니다. 알림 전송을 건너뜁니다.")
+        return
+
+    payload = {
+        "user_id": str(user_id),
+        "risk_score": float(predicted_score)
+    }
+
+    try:
+        response = requests.post(
+            LAMBDA_INVOKE_URL,
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload),
+            timeout=5  # 5초 타임아웃 설정
+        )
+        response.raise_for_status()
+        print(f"✅ Lambda 호출 성공. 응답 코드: {response.status_code}")
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Lambda 호출 실패: 네트워크/HTTP 오류 발생: {e}")
+
+
+def check_and_update_alert_time(user_id, is_warning=False):
+    """
+    마지막 알림 시간 또는 경고 발송 여부를 확인하고 업데이트합니다.
+    """
+
+    # 1. 경고(70점 초과) 최초 1회만 발송 체크
+    if is_warning:
+        # 경고 알림 파일이 존재하면 이미 발송된 것으로 간주
+        if os.path.exists(WARNING_ALERT_SENT_FILE):
+            return False  # 이미 발송됨
+
+        # 파일이 없으면 알림 발송 후 파일 생성 (발송 기록 남기기)
+        try:
+            with open(WARNING_ALERT_SENT_FILE, 'w') as f:
+                f.write(datetime.now().isoformat())
+            print(f"INFO: 경고 알림 기록 ({WARNING_ALERT_SENT_FILE}) 저장됨.")
+            return True  # 발송 허용
+        except Exception as e:
+            print(f"❌ WARNING_ALERT_SENT_FILE 쓰기 오류: {e}")
+            return False
+
+    # 2. 주의(60점 초과) 10분 간격 체크
+    if os.path.exists(CAUTION_ALERT_TIME_FILE):
+        try:
+            with open(CAUTION_ALERT_TIME_FILE, 'r') as f:
+                last_alert_str = f.read().strip()
+            last_alert_time = datetime.fromisoformat(last_alert_str)
+
+            # 10분이 지나지 않았으면 발송 금지
+            if (datetime.now() - last_alert_time) < timedelta(minutes=ALERT_INTERVAL_MINUTES):
+                print(f"INFO: 주의 알림은 {ALERT_INTERVAL_MINUTES}분 쿨타임 중입니다.")
+                return False
+        except Exception as e:
+            print(f"❌ CAUTION_ALERT_TIME_FILE 읽기 오류: {e}")
+            # 파일 오류 발생 시 안전을 위해 발송 허용 후 파일 덮어쓰기 시도
+
+    # 10분 지났거나 최초 발송 시, 현재 시간으로 업데이트하고 발송 허용
+    try:
+        with open(CAUTION_ALERT_TIME_FILE, 'w') as f:
+            f.write(datetime.now().isoformat())
+        print(f"INFO: 주의 알림 기록 ({CAUTION_ALERT_TIME_FILE}) 업데이트됨.")
+    except Exception as e:
+        print(f"❌ CAUTION_ALERT_TIME_FILE 쓰기 오류: {e}")
+        # 쓰기 실패해도 발송은 허용 (임시)
+
+    return True
+
 
 # ==========================
 # Flask 라우팅
@@ -677,37 +767,129 @@ def video_feed():
 # ----- 새로운 위험도 확인 라우트 ------
 @app.route('/get_score')
 def get_score():
-    # 🔑 최근 N초 동안의 평균 위험 점수를 계산
+    # --------------------------------------------------------
+    # 1. 로그인 사용자 확인 (필수: Lambda에 user_id를 보내기 위함)
+    # --------------------------------------------------------
+    # Flask-Login의 current_user 대신 session에서 직접 user_id를 가져옴
+    user_id = session.get('user_id')
+
+    if not user_id:
+        # 로그인되지 않은 상태에서는 점수만 0으로 반환하고 알림 로직은 실행하지 않음
+        return jsonify({"risk_score": 0.0, "status": "Not Authenticated"})
+
+    # --------------------------------------------------------
+    # 2. 최근 N초 동안의 평균 위험 점수 계산
+    # --------------------------------------------------------
     N_SECONDS = 2
+    avg_score = 0.0
     try:
-        # 최근 1초 동안의 데이터를 모두 불러옴 (MySQL 문법)
-        # TIMESTAMPADD(SECOND, -N_SECONDS, NOW())는 현재 시간으로부터 N초 전 시간을 의미
+        # 현재 로그인된 사용자의 최근 N초 동안의 데이터를 모두 불러옴
         query = f"""
                 SELECT risk_score 
                 FROM realtime_screen 
-                WHERE timestamp >= TIMESTAMPADD(SECOND, -{N_SECONDS}, NOW())
+                WHERE user_id = '{user_id}'  # 👈 사용자 ID 조건 추가
+                AND timestamp >= TIMESTAMPADD(SECOND, -{N_SECONDS}, NOW())
                 ORDER BY timestamp DESC
             """
         df = pd.read_sql_query(query, con=engine)
 
         if df.empty:
-            # 최근 1초간 데이터가 없으면, 가장 최근의 데이터라도 가져옴
+            # 최근 N초간 데이터가 없으면, 가장 최근의 데이터라도 가져옴
             df = pd.read_sql_query(
-                "SELECT risk_score FROM realtime_screen ORDER BY timestamp DESC LIMIT 1",
+                f"SELECT risk_score FROM realtime_screen WHERE user_id = '{user_id}' ORDER BY timestamp DESC LIMIT 1",
                 con=engine
             )
 
-        if df.empty:
-            avg_score = 0.0
-        else:
-            # 🔑 불러온 모든 점수의 평균을 계산
+        if not df.empty:
             avg_score = df['risk_score'].mean()
-
-        return jsonify({"risk_score": round(avg_score, 2)})
 
     except Exception as e:
         print(f"❌ get_score 조회 오류: {e}")
-        return jsonify({"risk_score": 0.0})
+        return jsonify({"risk_score": 0.0, "status": "DB Error"})
+
+    # --------------------------------------------------------
+    # 3. 알림 로직 및 Lambda 호출 준비
+    # --------------------------------------------------------
+    current_time = datetime.now()
+    alert_to_send = None  # 최종적으로 보낼 알림 레벨
+    cooldown_minutes = 10  # 기본 쿨다운 시간 (주의 알림 기준)
+
+    # 3-1. 경고(WARNING, 70점 이상) 확인
+    if avg_score >= 70.0:
+        alert_to_send = 'WARNING'
+        cooldown_minutes = 1440  # 경고는 거의 1회성 발송 (하루 쿨다운)
+    # 3-2. 주의(ATTENTION, 60점 이상) 확인
+    elif avg_score >= 60.0:
+        alert_to_send = 'ATTENTION'
+        cooldown_minutes = 10  # 10분마다 재발송 가능
+
+    # 알림 발송이 필요한 경우
+    if alert_to_send:
+        # 3-3. alert_history 테이블에서 마지막 전송 시간을 확인 (쿨다운 체크)
+        last_sent_time = None
+        try:
+            history_query = f"""
+                SELECT last_sent_timestamp 
+                FROM alert_history 
+                WHERE user_id = '{user_id}' 
+                AND alert_level = '{alert_to_send}'
+            """
+            history_df = pd.read_sql_query(history_query, con=engine)
+
+            if not history_df.empty:
+                last_sent_time = history_df['last_sent_timestamp'].iloc[0]
+
+                # WARNING 레벨인 경우, 이력이 있다면 발송을 건너뜁니다.
+                if alert_to_send == 'WARNING':
+                    print(f"✅ [{user_id}] {alert_to_send} 알림은 이미 발송된 이력이 있어 건너뜁니다.")
+                    alert_to_send = None
+
+        except Exception as e:
+            print(f"❌ alert_history 조회 오류: {e}")
+            # DB 조회 오류가 나도 일단 알림은 보내보도록 로직은 계속 진행됩니다.
+
+        # 3-4. ATTENTION 레벨의 경우 쿨다운 시간 확인
+        if alert_to_send == 'ATTENTION' and last_sent_time:
+            time_diff = current_time - last_sent_time
+            time_diff_seconds = time_diff.total_seconds()
+
+            # 쿨다운 시간(10분)이 지나지 않았다면 발송하지 않음
+            if time_diff_seconds < cooldown_minutes * 60:
+                print(
+                    f"⏱️ [{user_id}] {alert_to_send} 쿨다운({cooldown_minutes}분) 중. ({cooldown_minutes * 60 - time_diff_seconds:.0f}초 남음)")
+                alert_to_send = None  # 발송 조건 불만족
+
+        # 3-5. 최종 Lambda 호출
+        if alert_to_send:
+            print(f"🔥 [{user_id}] {alert_to_send} 알림 ({round(avg_score, 2)}점) 발송 시도...")
+
+            lambda_payload = {
+                "user_id": user_id,
+                "avg_score": round(avg_score, 2),
+                "alert_level": alert_to_send  # Lambda에서 문구 구분용
+            }
+
+            try:
+                # Lambda API Gateway 호출
+                response = requests.post(LAMBDA_INVOKE_URL, json=lambda_payload, timeout=5)
+
+                if response.status_code == 200:
+                    print(f"✅ Lambda 호출 성공. 응답 코드: {response.status_code}")
+                else:
+                    print(f"⚠️ Lambda 호출 실패. 응답 코드: {response.status_code}, 응답 내용: {response.text}")
+
+            except requests.exceptions.RequestException as req_err:
+                print(f"❌ Lambda 호출 중 예외 발생: {req_err}")
+
+    # --------------------------------------------------------
+    # 4. 최종 결과 반환
+    # --------------------------------------------------------
+    return jsonify({
+        "risk_score": round(avg_score, 2),
+        "status": "success",
+        "alert_attempted": bool(alert_to_send),
+        "current_user": user_id
+    })
 
     # 추후에 주의/경고 알림 보내는 코드 추가 예정
     # 경고음 및 주의임 초기 알람 후 간격 시간
