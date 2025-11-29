@@ -100,6 +100,12 @@ except Exception as e:
     scaler = DummyScaler()
     model = DummyModel()
 
+# 람다 관련
+API_GATEWAY_URL = "https://vuxwueif4c.execute-api.ap-northeast-2.amazonaws.com/default/lambda_monitor"
+
+ALERT_MIN_SCORE = 60.0
+
+
 # ==========================
 # 3. DB 연결 및 엔진 설정 (RDS 엔드포인트 사용)
 # ==========================
@@ -659,6 +665,44 @@ def check_and_update_alert_time(user_id, is_warning=False):
     return True
 
 
+# =======================================================
+# 💡 핵심: Lambda 함수로 알람 데이터를 전송하는 함수
+# =======================================================
+def send_alarm_to_lambda(user_id, risk_score):
+    """
+    API Gateway를 통해 AWS Lambda 함수로 알람 요청을 보냅니다.
+    """
+    if risk_score <= ALERT_MIN_SCORE:
+        print(
+            f"INFO: Risk score {risk_score:.2f} is below the alarm threshold of {ALERT_MIN_SCORE}. Skipping Lambda call.")
+        return
+
+    payload = {
+        "user_id": user_id,
+        # Lambda 코드에서는 'risk_score'와 'avg_score' 모두 처리 가능하지만, 명확하게 보냅니다.
+        "risk_score": risk_score
+    }
+
+    headers = {'Content-Type': 'application/json'}
+
+    print(f"INFO: Sending alarm data to Lambda via API Gateway for User {user_id} with Score {risk_score:.2f}...")
+
+    try:
+        # API Gateway로 POST 요청을 보냅니다.
+        response = requests.post(API_GATEWAY_URL, headers=headers, data=json.dumps(payload), timeout=5)
+        response.raise_for_status()  # HTTP 오류가 발생하면 예외를 발생시킵니다.
+
+        print(f"✅ Successfully triggered Lambda. API Gateway Response Status: {response.status_code}")
+        # Lambda의 응답 본문은 실제 알림 성공/실패와 관련이 없으므로 간결하게 처리합니다.
+
+    except requests.exceptions.Timeout:
+        print(f"❌ Error: API Gateway request timed out.")
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error sending data to API Gateway: {e}")
+    except Exception as e:
+        print(f"❌ An unexpected error occurred: {e}")
+
+
 # ==========================
 # Flask 라우팅
 # ==========================
@@ -895,6 +939,35 @@ def get_score():
     # 경고음 및 주의임 초기 알람 후 간격 시간
     # 주의 : 최조 주의 알람에서 10분 기준으로 알림 다시 발송
     # 경고 : 최조 경고 알람 (1번)
+
+# =======================================================
+# 예시: 점수를 계산하고 알람을 전송하는 메인 API 엔드포인트
+# =======================================================
+@app.route('/calculate_and_alert', methods=['POST'])
+def calculate_and_alert():
+    data = request.json
+    user_id = data.get('user_id')
+    raw_scores = data.get('raw_scores') # 예: [70, 80, 76]
+
+    if not user_id or not raw_scores:
+        return jsonify({"message": "Missing user_id or raw_scores"}), 400
+
+    # 1. 화면에 띄울 점수를 계산하는 로직 (예시: 평균 점수)
+    # 화면에 띄우는 점수(예: 75.50)가 계산되었다고 가정합니다.
+    risk_score = sum(raw_scores) / len(raw_scores) if raw_scores else 0.0
+    risk_score = round(risk_score, 2)
+
+    # 2. 위험 점수 확인 후, Lambda 알람 전송 함수 호출
+    if risk_score > ALERT_MIN_SCORE:
+        # 알람 전송은 비동기로 처리되므로, 결과를 기다릴 필요 없이 즉시 호출합니다.
+        send_alarm_to_lambda(user_id, risk_score)
+
+    return jsonify({
+        "user_id": user_id,
+        "final_risk_score": risk_score,
+        "message": f"Score calculated. Alarm triggered if score > {ALERT_MIN_SCORE}."
+    }), 200
+
 
 # ==========================
 # 서버 실행 및 스레드 실행
