@@ -91,7 +91,6 @@ except Exception as e:
 
         feature_names_in_ = []
 
-
     class DummyModel:
         def predict_proba(self, X): return np.array([[1.0, 0.0]])
 
@@ -102,14 +101,11 @@ except Exception as e:
 
 # 람다 관련
 API_GATEWAY_URL = "https://vuxwueif4c.execute-api.ap-northeast-2.amazonaws.com/default/lambda_monitor"
-
 ALERT_MIN_SCORE = 60.0
-
 
 # ==========================
 # 3. DB 연결 및 엔진 설정 (RDS 엔드포인트 사용)
 # ==========================
-
 # SQLAlchemy 엔진 생성 (비밀번호를 URL-safe 인코딩하여 RDS 엔드포인트 사용)
 password_encoded = quote_plus(DB_PASSWORD)
 try:
@@ -121,7 +117,6 @@ try:
 except Exception as e:
     print(f"❌ SQLAlchemy Engine configuration failed: {e}")
     engine = None
-
 
 # DB 연결 함수 (pymysql을 사용하여 RDS 엔드포인트 사용)
 def get_db_connection():
@@ -138,7 +133,6 @@ def get_db_connection():
     except Exception as e:
         print(f"❌ DB Connection Error (check RDS host/security group): {e}")
         return None
-
 
 # ==========================
 # 4. MediaPipe 및 기타 로직 (변경 없음)
@@ -976,5 +970,3 @@ if __name__ == "__main__":
     threading.Thread(target=connect_camera_loop, daemon=True).start()
     threading.Thread(target=capture_frames, daemon=True).start()
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-    # 배표시 변경 사항
-    # app.run(host='0.0.0.0', port=5000, threaded=True, use_reloader=False, threaded=True)
